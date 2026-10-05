@@ -1,5 +1,10 @@
+export interface Button {
+  text: string;
+  data: string;
+}
+
 export interface Notifier {
-  send(text: string): Promise<void>;
+  send(text: string, opts?: { buttons?: Button[][] }): Promise<{ messageId: number }>;
 }
 
 // Carries only a pre-sanitized description: transport errors can contain the bot token.

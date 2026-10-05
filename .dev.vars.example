@@ -1,3 +1,12 @@
-STRIPE_WEBHOOK_SECRET=
+# The test bot's token from BotFather (never the production bot).
 TELEGRAM_BOT_TOKEN=
+# The test group's chat id.
 TELEGRAM_CHAT_ID=
+# The whsec_ value printed by `stripe listen`.
+STRIPE_WEBHOOK_SECRET=
+# Any value; independent of production. `pnpm dev:telegram` sends it with every update.
+TELEGRAM_WEBHOOK_SECRET=
+# Optional: where `pnpm dev:telegram` forwards updates (default http://localhost:8787/telegram/webhook).
+# DEV_WORKER_URL=
+# Spike: the published Lessons calendar link (webcal:// or https://). Test it with GET /spike/calendar.
+LESSONS_CALENDAR_URL=

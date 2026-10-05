@@ -46,6 +46,32 @@ describe("toPaymentReceived", () => {
     expect(p?.customerEmail).toBe("a@example.com");
   });
 
+  test.each([
+    ["a string", "plink_1", "plink_1"],
+    ["an expanded object", { id: "plink_1", object: "payment_link" }, "plink_1"],
+    ["null", null, null],
+  ])("payment_link as %s", (_name, payment_link, expected) => {
+    expect(completed({ payment_link })?.paymentLinkId).toBe(expected);
+  });
+
+  test("payment_link absent -> null", () => {
+    expect(completed({})?.paymentLinkId).toBeNull();
+  });
+
+  test("email is trimmed and lowercased", () => {
+    expect(completed({ customer_details: { email: " Anna@X.com " } })?.customerEmail).toBe("anna@x.com");
+  });
+
+  test("blank customer_details.email falls back to customer_email", () => {
+    const p = completed({ customer_details: { email: "  " }, customer_email: "b@x.com" });
+    expect(p?.customerEmail).toBe("b@x.com");
+  });
+
+  test("blank or absent emails -> null", () => {
+    expect(completed({ customer_details: { email: "  " }, customer_email: " " })?.customerEmail).toBeNull();
+    expect(completed({ customer_details: null, customer_email: null })?.customerEmail).toBeNull();
+  });
+
   test("null metadata -> {}", () => {
     expect(completed({ metadata: null })?.source.metadata).toEqual({});
   });

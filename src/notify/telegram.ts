@@ -8,9 +8,18 @@ export function createTelegramApi(token: string): Api {
 export function createTelegramNotifier(opts: { token: string; chatId: string; api?: Api }): Notifier {
   const api = opts.api ?? createTelegramApi(opts.token);
   return {
-    async send(text) {
+    async send(text, sendOpts) {
+      const buttons = sendOpts?.buttons;
       try {
-        await api.sendMessage(opts.chatId, text, { link_preview_options: { is_disabled: true } });
+        const sent = await api.sendMessage(opts.chatId, text, {
+          link_preview_options: { is_disabled: true },
+          ...(buttons && {
+            reply_markup: {
+              inline_keyboard: buttons.map((row) => row.map((b) => ({ text: b.text, callback_data: b.data }))),
+            },
+          }),
+        });
+        return { messageId: sent.message_id };
       } catch (err) {
         if (err instanceof GrammyError) {
           throw new NotifyError(`telegram ${err.error_code}: ${err.description}`);

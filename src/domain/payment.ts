@@ -4,6 +4,7 @@ export interface PaymentReceived {
   customerName: string | null;
   customerEmail: string | null;
   paymentIntentId: string | null;
+  paymentLinkId: string | null;
   livemode: boolean;
   source: {
     provider: "stripe";

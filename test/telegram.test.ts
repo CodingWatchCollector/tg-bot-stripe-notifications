@@ -27,6 +27,32 @@ describe("createTelegramNotifier", () => {
     ]);
   });
 
+  test("returns the message id", async () => {
+    const { api } = stubApi(() => ({ ok: true, result: { message_id: 77 } }));
+    expect(await createTelegramNotifier({ token: "123:abc", chatId: "42", api }).send("hello")).toEqual({ messageId: 77 });
+  });
+
+  test("maps buttons to an inline keyboard", async () => {
+    const { api, calls } = stubApi(() => ({ ok: true, result: { message_id: 1 } }));
+    await createTelegramNotifier({ token: "123:abc", chatId: "42", api }).send("pick", {
+      buttons: [[{ text: "A", data: "p:1:new" }], [{ text: "B", data: "p:1:x" }, { text: "C", data: "p:1:s:2" }]],
+    });
+    expect(calls[0]?.payload).toEqual({
+      chat_id: "42",
+      text: "pick",
+      link_preview_options: { is_disabled: true },
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "A", callback_data: "p:1:new" }],
+          [
+            { text: "B", callback_data: "p:1:x" },
+            { text: "C", callback_data: "p:1:s:2" },
+          ],
+        ],
+      },
+    });
+  });
+
   test("Telegram error becomes a NotifyError without the token", async () => {
     const { api } = stubApi(() => ({ ok: false, error_code: 403, description: "Forbidden" }));
     const err = await createTelegramNotifier({ token: "123:abc", chatId: "42", api })

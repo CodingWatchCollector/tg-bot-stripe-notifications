@@ -3,6 +3,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-26",
   // Logs only. Do not enable traces: fetch spans would record the Telegram URL, which contains the bot token.
-  "observability": { "enabled": true }
-  // Secrets (set with `wrangler secret put`): STRIPE_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  "observability": { "enabled": true },
+  // No database_id: the remote database is resolved by name. Create it with `pnpm exec wrangler d1 create tg-bot`.
+  "d1_databases": [{ "binding": "DB", "database_name": "tg-bot", "migrations_dir": "migrations" }]
+  // Secrets (set each with `pnpm exec wrangler secret put <NAME>`): STRIPE_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN,
+  // TELEGRAM_CHAT_ID, TELEGRAM_WEBHOOK_SECRET
 }
