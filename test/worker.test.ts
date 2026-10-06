@@ -196,11 +196,18 @@ function recordingApi(respond: () => unknown = () => ({ ok: true, result: { mess
 const LINK = "https://dashboard.stripe.com/payments/pi_123";
 const rows = () => fake.raw.all("SELECT status, student_id, message_id, notified_at, customer_email FROM payments");
 
-async function deliver(session: Record<string, unknown> = {}, opts: { api?: Api; type?: string; id?: string } = {}) {
+async function deliver(
+  session: Record<string, unknown> = {},
+  opts: { api?: Api; type?: string; id?: string; livemode?: boolean } = {},
+) {
   const recorded = recordingApi();
   const api = opts.api ?? recorded.api;
   const makeNotifier = () => createTelegramNotifier({ token: "123:abc", chatId: "-100777", api });
-  const event = sessionEvent(opts.type ?? "checkout.session.completed", { amount_total: 16000, ...session }, opts.id ? { id: opts.id } : {});
+  const event = sessionEvent(
+    opts.type ?? "checkout.session.completed",
+    { amount_total: 16000, ...session },
+    { ...(opts.id && { id: opts.id }), ...(opts.livemode !== undefined && { livemode: opts.livemode }) },
+  );
   const res = await createWorker({ makeNotifier, makeBot }).fetch(await signedPaid(FULL_ENV.STRIPE_WEBHOOK_SECRET, event), env());
   return { res, calls: recorded.calls };
 }
@@ -224,7 +231,7 @@ describe("wiring", () => {
     expect(calls[0]?.method).toBe("sendMessage");
     expect(calls[0]?.payload).toMatchObject({
       chat_id: "42",
-      text: `💶 Unknown payer paid 45.00 EUR\nAnna K <anna@example.com>\nWho is this?\n${LINK}`,
+      text: `💶 Unknown payer paid 45,00\u00a0€\nAnna K <anna@example.com>\nWho is this?\n${LINK}`,
     });
   });
 });
@@ -235,16 +242,21 @@ describe("Stripe delivery", () => {
     const { res, calls } = await deliver({ customer_details: { name: "Whoever", email: " OLENA@Example.com " } });
     expect(res.status).toBe(200);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.payload.text).toBe(`💶 Olena paid 160.00 EUR\n${LINK}`);
+    expect(calls[0]?.payload.text).toBe(`💶 Olena paid 160,00\u00a0€\n${LINK}`);
     expect(calls[0]?.payload.reply_markup).toBeUndefined();
     expect(rows()).toMatchObject([{ status: "assigned", student_id: olena, message_id: 55 }]);
     expect(rows()[0]?.notified_at).not.toBeNull();
   });
 
+  test("a test-mode event still gets the live dashboard link", async () => {
+    const { calls } = await deliver({}, { livemode: false });
+    expect(String(calls[0]?.payload.text).endsWith(`\n${LINK}`)).toBe(true);
+  });
+
   test("archived payer is announced by name and stays archived", async () => {
     addStudent(fake, "Old One", { emails: ["old@example.com"], archived: true });
     const { calls } = await deliver({ customer_details: { name: "X", email: "old@example.com" } });
-    expect(calls[0]?.payload.text).toBe(`💶 Old One paid 160.00 EUR\n${LINK}`);
+    expect(calls[0]?.payload.text).toBe(`💶 Old One paid 160,00\u00a0€\n${LINK}`);
     expect(calls[0]?.payload.reply_markup).toBeUndefined();
     expect(fake.raw.all("SELECT archived FROM students")).toEqual([{ archived: 1 }]);
   });
@@ -254,7 +266,7 @@ describe("Stripe delivery", () => {
     const ira = addStudent(fake, "Ira + Pasha");
     addStudent(fake, "Old One", { archived: true });
     const { calls } = await deliver();
-    expect(calls[0]?.payload.text).toBe(`💶 Unknown payer paid 160.00 EUR\nAnna K <anna@example.com>\nWho is this?\n${LINK}`);
+    expect(calls[0]?.payload.text).toBe(`💶 Unknown payer paid 160,00\u00a0€\nAnna K <anna@example.com>\nWho is this?\n${LINK}`);
     const keyboard = (calls[0]?.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
     expect(keyboard.map((r) => r.map((b) => b.text))).toEqual([["➕ New student"], ["Ira + Pasha", "Olena"], ["✖️ Cancel"]]);
     expect(keyboard[1]?.[0]?.callback_data).toBe(`p:1:s:${ira}`);

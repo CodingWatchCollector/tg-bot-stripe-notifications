@@ -20,9 +20,9 @@ const base: PaymentFacts = {
   customerName: "Anna K",
   customerEmail: "anna@example.com",
   paymentIntentId: "pi_123",
-  livemode: true,
 };
 const LINK = "https://dashboard.stripe.com/payments/pi_123";
+const EUR160 = "160,00\u00a0€";
 
 const student = (id: number, name: string): Student => ({
   id,
@@ -34,26 +34,20 @@ const student = (id: number, name: string): Student => ({
 });
 
 describe("formatAmount", () => {
-  test("two decimals", () => expect(formatAmount(16000, "eur")).toBe("160.00 EUR"));
-  test.each("bif clp djf gnf jpy kmf krw mga pyg rwf ugx vnd vuv xaf xof xpf".split(" "))("zero-decimal %s", (code) => {
-    expect(formatAmount(5000, code)).toBe(`5000 ${code.toUpperCase()}`);
-  });
-  test.each("bhd jod kwd omr tnd".split(" "))("three-decimal %s", (code) => {
-    expect(formatAmount(12345, code)).toBe(`12.345 ${code.toUpperCase()}`);
-  });
-  test.each("huf isk twd eur usd".split(" "))("two-decimal %s", (code) => {
-    expect(formatAmount(100000, code)).toBe(`1000.00 ${code.toUpperCase()}`);
-  });
+  test.each([
+    [16000, "eur", "160,00\u00a0€"],
+    [16000, "EUR", "160,00\u00a0€"],
+    [123450, "eur", "1\u202f234,50\u00a0€"],
+    [50, "eur", "0,50\u00a0€"],
+    [16000, "usd", "160,00\u00a0$US"],
+  ])("%s %s", (amount, currency, text) => expect(formatAmount(amount, currency)).toBe(text));
   test("unknown amount", () => expect(formatAmount(null, "eur")).toBe("amount unknown"));
   test("unknown currency", () => expect(formatAmount(4500, null)).toBe("amount unknown"));
 });
 
 describe("dashboardLink", () => {
-  test("live", () => expect(dashboardLink("pi_123", true)).toBe(LINK));
-  test("test mode", () => {
-    expect(dashboardLink("pi_123", false)).toBe("https://dashboard.stripe.com/test/payments/pi_123");
-  });
-  test("no payment intent", () => expect(dashboardLink(null, true)).toBeNull());
+  test("live", () => expect(dashboardLink("pi_123")).toBe(LINK));
+  test("no payment intent", () => expect(dashboardLink(null)).toBeNull());
 });
 
 describe("customerLine", () => {
@@ -69,15 +63,15 @@ describe("customerLine", () => {
 
 describe("templates", () => {
   test("known payer", () => {
-    expect(knownPayerText("Olena", base)).toBe(`💶 Olena paid 160.00 EUR\n${LINK}`);
+    expect(knownPayerText("Olena", base)).toBe(`💶 Olena paid ${EUR160}\n${LINK}`);
   });
 
   test("link line is omitted without a payment intent", () => {
-    expect(knownPayerText("Olena", { ...base, paymentIntentId: null })).toBe("💶 Olena paid 160.00 EUR");
+    expect(knownPayerText("Olena", { ...base, paymentIntentId: null })).toBe(`💶 Olena paid ${EUR160}`);
   });
 
   test("unknown payer", () => {
-    expect(unknownPayerText(base)).toBe(`💶 Unknown payer paid 160.00 EUR\nAnna K <anna@example.com>\nWho is this?\n${LINK}`);
+    expect(unknownPayerText(base)).toBe(`💶 Unknown payer paid ${EUR160}\nAnna K <anna@example.com>\nWho is this?\n${LINK}`);
   });
 
   test("unknown amount in a template", () => {
@@ -86,26 +80,26 @@ describe("templates", () => {
 
   test("assigned with a saved email", () => {
     expect(assignedText("Ira + Pasha", base, "saved")).toBe(
-      `💶 Ira + Pasha paid 160.00 EUR\nanna@example.com saved as Ira + Pasha's email\n${LINK}`,
+      `💶 Ira + Pasha paid ${EUR160}\nanna@example.com saved as Ira + Pasha's email\n${LINK}`,
     );
   });
 
   test("assigned with an email owned by another student", () => {
     expect(assignedText("Ira + Pasha", base, { ownedBy: { name: "Olena" } })).toBe(
-      `💶 Ira + Pasha paid 160.00 EUR\nanna@example.com already belongs to Olena\n${LINK}`,
+      `💶 Ira + Pasha paid ${EUR160}\nanna@example.com already belongs to Olena\n${LINK}`,
     );
   });
 
   test.each([["none" as const], ["saved" as const]])("assigned without an email has no second line (%s)", (outcome) => {
-    expect(assignedText("Ira", { ...base, customerEmail: null }, outcome)).toBe(`💶 Ira paid 160.00 EUR\n${LINK}`);
+    expect(assignedText("Ira", { ...base, customerEmail: null }, outcome)).toBe(`💶 Ira paid ${EUR160}\n${LINK}`);
   });
 
   test("assigned, nothing to report", () => {
-    expect(assignedText("Ira", base)).toBe(`💶 Ira paid 160.00 EUR\n${LINK}`);
+    expect(assignedText("Ira", base)).toBe(`💶 Ira paid ${EUR160}\n${LINK}`);
   });
 
   test("dismissed", () => {
-    expect(dismissedText(base)).toBe(`💶 Payment dismissed: 160.00 EUR\nAnna K <anna@example.com>\n${LINK}`);
+    expect(dismissedText(base)).toBe(`💶 Payment dismissed: ${EUR160}\nAnna K <anna@example.com>\n${LINK}`);
   });
 });
 
@@ -138,6 +132,24 @@ describe("pickerButtons", () => {
     expect(names).toHaveLength(90);
     expect(names[0]).toBe("S000");
     expect(names[89]).toBe("S089");
+  });
+
+  test("the suggestion counts toward the 90 student buttons", () => {
+    const many = Array.from({ length: 91 }, (_, i) => student(i + 1, `S${String(i).padStart(3, "0")}`));
+    const rows = pickerButtons(1, many, "s050");
+    const middle = rows.slice(1, -1);
+    expect(texts(rows)[0]).toEqual(["➕ New student"]);
+    expect(texts(rows).at(-1)).toEqual(["✖️ Cancel"]);
+    expect(texts(middle)[0]).toEqual(["💡 S050"]);
+    const rest = middle.slice(1);
+    expect(rest).toHaveLength(45);
+    expect(rest.at(-1)).toHaveLength(1);
+    const names = rest.flat().map((b) => b.text);
+    expect(names).toHaveLength(89);
+    expect(names[0]).toBe("S000");
+    expect(names[88]).toBe("S089");
+    expect(names).not.toContain("S050");
+    expect(middle.flat()).toHaveLength(90);
   });
 
   test("callback data stays within 64 bytes", () => {

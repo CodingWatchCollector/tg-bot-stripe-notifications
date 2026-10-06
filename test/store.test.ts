@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { createStore, type Store } from "../src/db/store";
 import { createD1Fake, type D1Fake } from "./support/d1";
 import { addStudent, payment } from "./support/seed";
@@ -21,8 +21,8 @@ describe("schema constraints", () => {
     fake.raw.run(`INSERT INTO payments(${cols}, created_at) VALUES (${params.map((_, i) => `?${i + 1}`).join(",")}, 't')`, ...params);
 
   test("unique checkout session id", () => {
-    pay("checkout_session_id, status, livemode", "cs", "unassigned", 1);
-    rejects("INSERT INTO payments(checkout_session_id, status, livemode, created_at) VALUES ('cs','unassigned',1,'t')");
+    pay("checkout_session_id, status", "cs", "unassigned");
+    rejects("INSERT INTO payments(checkout_session_id, status, created_at) VALUES ('cs','unassigned','t')");
   });
 
   test("one row per payer email", () => {
@@ -38,23 +38,22 @@ describe("schema constraints", () => {
 
   test("status and student must agree", () => {
     student();
-    rejects("INSERT INTO payments(checkout_session_id, status, livemode, created_at) VALUES ('c1','assigned',1,'t')");
-    rejects("INSERT INTO payments(checkout_session_id, status, student_id, livemode, created_at) VALUES ('c2','unassigned',1,1,'t')");
-    rejects("INSERT INTO payments(checkout_session_id, status, student_id, livemode, created_at) VALUES ('c3','dismissed',1,1,'t')");
+    rejects("INSERT INTO payments(checkout_session_id, status, created_at) VALUES ('c1','assigned','t')");
+    rejects("INSERT INTO payments(checkout_session_id, status, student_id, created_at) VALUES ('c2','unassigned',1,'t')");
+    rejects("INSERT INTO payments(checkout_session_id, status, student_id, created_at) VALUES ('c3','dismissed',1,'t')");
   });
 
   test("status outside the three values", () => {
-    rejects("INSERT INTO payments(checkout_session_id, status, livemode, created_at) VALUES ('c','paid',1,'t')");
+    rejects("INSERT INTO payments(checkout_session_id, status, created_at) VALUES ('c','paid','t')");
   });
 
-  test("archived and livemode are 0/1", () => {
+  test("archived is 0/1", () => {
     rejects("INSERT INTO students(name, name_key, archived, created_at) VALUES ('A','a',2,'t')");
-    rejects("INSERT INTO payments(checkout_session_id, status, livemode, created_at) VALUES ('c','unassigned',2,'t')");
   });
 
   test("student references must exist", () => {
     rejects("INSERT INTO payer_emails(email, student_id) VALUES ('a@x.com', 99)");
-    rejects("INSERT INTO payments(checkout_session_id, status, student_id, livemode, created_at) VALUES ('c','assigned',99,1,'t')");
+    rejects("INSERT INTO payments(checkout_session_id, status, student_id, created_at) VALUES ('c','assigned',99,'t')");
   });
 
   test.each([
@@ -62,10 +61,9 @@ describe("schema constraints", () => {
     ["students.name_key", "INSERT INTO students(name, created_at) VALUES ('A','t')"],
     ["students.created_at", "INSERT INTO students(name, name_key) VALUES ('A','a')"],
     ["payer_emails.student_id", "INSERT INTO payer_emails(email) VALUES ('a@x.com')"],
-    ["payments.checkout_session_id", "INSERT INTO payments(status, livemode, created_at) VALUES ('unassigned',1,'t')"],
-    ["payments.status", "INSERT INTO payments(checkout_session_id, livemode, created_at) VALUES ('c',1,'t')"],
-    ["payments.livemode", "INSERT INTO payments(checkout_session_id, status, created_at) VALUES ('c','unassigned','t')"],
-    ["payments.created_at", "INSERT INTO payments(checkout_session_id, status, livemode) VALUES ('c','unassigned',1)"],
+    ["payments.checkout_session_id", "INSERT INTO payments(status, created_at) VALUES ('unassigned','t')"],
+    ["payments.status", "INSERT INTO payments(checkout_session_id, created_at) VALUES ('c','t')"],
+    ["payments.created_at", "INSERT INTO payments(checkout_session_id, status) VALUES ('c','unassigned')"],
   ])("NOT NULL %s", (_col, sql) => {
     rejects(sql);
   });
@@ -99,7 +97,6 @@ describe("recordPayment", () => {
       customerEmail: "anna@example.com",
       paymentIntentId: "pi_123",
       paymentLinkId: "plink_1",
-      livemode: true,
       messageId: null,
       notifiedAt: null,
     });
@@ -129,9 +126,9 @@ describe("recordPayment", () => {
     expect(id).toBeGreaterThan(0);
   });
 
-  test("livemode false is stored as 0 and read back as false", async () => {
-    const view = await store.recordPayment(payment({ livemode: false }), null);
-    expect(view.livemode).toBe(false);
+  test("the stored payment view has no mode flag", async () => {
+    const view = await store.recordPayment(payment(), null);
+    expect(view).not.toHaveProperty("livemode");
   });
 });
 
@@ -255,6 +252,15 @@ describe("createStudentAndAssign", () => {
     expect(count("payer_emails")).toBe(0);
   });
 
+  test("a successful create reads the payment twice", async () => {
+    const p = await store.recordPayment(payment(), null);
+    const prepare = vi.spyOn(fake, "prepare");
+    const out = await store.createStudentAndAssign(p.id, "Marie Curie");
+    expect(out.kind).toBe("assigned");
+    const reads = prepare.mock.calls.filter(([sql]) => sql.includes("FROM payments p LEFT JOIN students"));
+    expect(reads).toHaveLength(2);
+  });
+
   test("unknown payment", async () => {
     expect(await store.createStudentAndAssign(99, "X")).toEqual({ kind: "not_found" });
     expect(count("students")).toBe(0);
@@ -270,13 +276,77 @@ describe("createStudentAndAssign", () => {
 });
 
 describe("dismissPayment", () => {
-  test("dismisses an unassigned payment once", async () => {
+  test("dismisses an unassigned payment once and returns the dismissed row", async () => {
     const p = await store.recordPayment(payment(), null);
-    expect(await store.dismissPayment(p.id)).toBe("ok");
+    expect(await store.dismissPayment(p.id)).toMatchObject({ kind: "dismissed", payment: { id: p.id, status: "dismissed" } });
     expect((await store.getPayment(p.id))?.status).toBe("dismissed");
-    expect(await store.dismissPayment(p.id)).toBe("already_resolved");
-    expect(await store.dismissPayment(99)).toBe("not_found");
+    expect(await store.dismissPayment(p.id)).toMatchObject({ kind: "already_resolved", payment: { status: "dismissed" } });
+    expect(await store.dismissPayment(99)).toEqual({ kind: "not_found" });
     expect(count("payer_emails")).toBe(0);
+  });
+});
+
+describe("lost races", () => {
+  const hook = (sql: string, ...params: (string | number)[]) => {
+    let ran = 0;
+    fake.beforeNextBatch(() => {
+      ran++;
+      fake.raw.run(sql, ...params);
+    });
+    return () => ran;
+  };
+  const dismissRow = "UPDATE payments SET status = 'dismissed' WHERE id = ?1";
+  const paymentRow = () => rows("SELECT status, student_id FROM payments");
+
+  test("assignPayment loses to a dismiss", async () => {
+    const sid = addStudent(fake, "Ira");
+    const p = await store.recordPayment(payment(), null);
+    const ran = hook(dismissRow, p.id);
+    const out = await store.assignPayment(p.id, sid);
+    expect(out).toMatchObject({ kind: "already_resolved", payment: { status: "dismissed", studentId: null } });
+    expect(paymentRow()).toEqual([{ status: "dismissed", student_id: null }]);
+    expect(count("payer_emails")).toBe(0);
+    expect(ran()).toBe(1);
+  });
+
+  test("createStudentAndAssign loses to a dismiss and leaves no orphan student", async () => {
+    const p = await store.recordPayment(payment(), null);
+    const ran = hook(dismissRow, p.id);
+    const out = await store.createStudentAndAssign(p.id, "Marie Curie");
+    expect(out).toMatchObject({ kind: "already_resolved", payment: { status: "dismissed" } });
+    expect(count("students")).toBe(0);
+    expect(count("payer_emails")).toBe(0);
+    expect(paymentRow()).toEqual([{ status: "dismissed", student_id: null }]);
+    expect(ran()).toBe(1);
+  });
+
+  test("createStudentAndAssign loses the name to a concurrent insert", async () => {
+    const p = await store.recordPayment(payment(), null);
+    const ran = hook("INSERT INTO students(name, name_key, created_at) VALUES ('Marie Curie', 'marie curie', 't')");
+    const out = await store.createStudentAndAssign(p.id, "marie  curie");
+    expect(out).toMatchObject({ kind: "name_taken", existing: { name: "Marie Curie" } });
+    expect(rows("SELECT name FROM students")).toEqual([{ name: "Marie Curie" }]);
+    expect(paymentRow()).toEqual([{ status: "unassigned", student_id: null }]);
+    expect(count("payer_emails")).toBe(0);
+    expect(ran()).toBe(1);
+  });
+
+  test("dismissPayment loses to an assign", async () => {
+    const sid = addStudent(fake, "Ira");
+    const p = await store.recordPayment(payment(), null);
+    const ran = hook("UPDATE payments SET status = 'assigned', student_id = ?2 WHERE id = ?1", p.id, sid);
+    const out = await store.dismissPayment(p.id);
+    expect(out).toMatchObject({ kind: "already_resolved", payment: { status: "assigned", studentId: sid } });
+    expect(paymentRow()).toEqual([{ status: "assigned", student_id: sid }]);
+    expect(ran()).toBe(1);
+  });
+
+  test("dismissPayment loses to another dismiss", async () => {
+    const p = await store.recordPayment(payment(), null);
+    const ran = hook(dismissRow, p.id);
+    const out = await store.dismissPayment(p.id);
+    expect(out).toMatchObject({ kind: "already_resolved", payment: { status: "dismissed" } });
+    expect(ran()).toBe(1);
   });
 });
 

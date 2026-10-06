@@ -8,7 +8,6 @@ export const expectedPayment: PaymentReceived = {
   customerEmail: "anna@example.com",
   paymentIntentId: "pi_123",
   paymentLinkId: null,
-  livemode: true,
   source: {
     provider: "stripe",
     eventId: "evt_1",

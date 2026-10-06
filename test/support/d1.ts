@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
-import migration from "../../migrations/0001_students_payments.sql?raw";
+import first from "../../migrations/0001_students_payments.sql?raw";
+import second from "../../migrations/0002_drop_payments_livemode.sql?raw";
 
 type Value = string | number | bigint | null;
 type Row = Record<string, Value>;
@@ -14,8 +15,10 @@ const clean = (row: Row): Row => Object.fromEntries(Object.entries(row).map(([k,
 export function createD1Fake() {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  db.exec(migration);
+  db.exec(first);
+  db.exec(second);
   let failing: Method | "any" | null = null;
+  let beforeBatch: (() => void) | null = null;
 
   const guard = (method: Method) => {
     if (failing === "any" || failing === method) {
@@ -24,8 +27,21 @@ export function createD1Fake() {
     }
   };
 
+  const checkPlaceholders = (sql: string, params: Value[]) => {
+    const seen: number[] = [];
+    for (const m of sql.matchAll(/\?(\d*)/g)) {
+      const n = Number(m[1]);
+      if (m[1] === "" || (!seen.includes(n) && n !== seen.length + 1)) {
+        throw new Error("d1 fake: placeholders must be ?1..?n in order of first appearance");
+      }
+      if (!seen.includes(n)) seen.push(n);
+    }
+    if (seen.length !== params.length) throw new Error(`d1 fake: expected ${seen.length} bound values, got ${params.length}`);
+  };
+
   const exec = (sql: string, params: Value[]) => {
     if (TRANSACTION_SQL.test(sql)) throw new Error("d1 fake: transaction statements are not allowed");
+    checkPlaceholders(sql, params);
     const stmt = db.prepare(sql);
     if (READS_ROWS.test(sql)) {
       const results = stmt.all(...params).map(clean);
@@ -67,6 +83,9 @@ export function createD1Fake() {
   const fake = {
     prepare: (sql: string) => statement(sql),
     async batch(stmts: Statement[]) {
+      const hook = beforeBatch;
+      beforeBatch = null;
+      hook?.();
       guard("batch");
       db.exec("BEGIN");
       try {
@@ -77,6 +96,9 @@ export function createD1Fake() {
         db.exec("ROLLBACK");
         throw err;
       }
+    },
+    beforeNextBatch(fn: () => void) {
+      beforeBatch = fn;
     },
     failNext(method: Method | "any" = "any") {
       failing = method;

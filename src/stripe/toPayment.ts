@@ -19,7 +19,6 @@ export function toPaymentReceived(event: Stripe.Event): PaymentReceived | null {
     customerEmail: email?.toLowerCase() ?? null,
     paymentIntentId: typeof intent === "string" ? intent : (intent?.id ?? null),
     paymentLinkId: typeof link === "string" ? link : (link?.id ?? null),
-    livemode: event.livemode,
     source: {
       provider: "stripe",
       eventId: event.id,

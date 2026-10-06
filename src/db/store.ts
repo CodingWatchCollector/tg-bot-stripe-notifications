@@ -15,7 +15,6 @@ export interface PaymentView {
   customerEmail: string | null;
   paymentIntentId: string | null;
   paymentLinkId: string | null;
-  livemode: boolean;
   messageId: number | null;
   notifiedAt: string | null;
   createdAt: string;
@@ -23,6 +22,11 @@ export interface PaymentView {
 
 export type AssignOutcome =
   | { kind: "assigned"; payment: PaymentView; email: "saved" | "none" | { ownedBy: Student } }
+  | { kind: "already_resolved"; payment: PaymentView }
+  | { kind: "not_found" };
+
+export type DismissOutcome =
+  | { kind: "dismissed"; payment: PaymentView }
   | { kind: "already_resolved"; payment: PaymentView }
   | { kind: "not_found" };
 
@@ -36,7 +40,7 @@ export interface Store {
   getPayment(id: number): Promise<PaymentView | null>;
   assignPayment(paymentId: number, studentId: number): Promise<AssignOutcome>;
   createStudentAndAssign(paymentId: number, name: string): Promise<AssignOutcome | { kind: "name_taken"; existing: Student }>;
-  dismissPayment(paymentId: number): Promise<"ok" | "already_resolved" | "not_found">;
+  dismissPayment(paymentId: number): Promise<DismissOutcome>;
 }
 
 type Row = Record<string, unknown>;
@@ -62,7 +66,6 @@ const toPayment = (r: Row): PaymentView => ({
   customerEmail: (r.customer_email as string | null) ?? null,
   paymentIntentId: (r.payment_intent_id as string | null) ?? null,
   paymentLinkId: (r.payment_link_id as string | null) ?? null,
-  livemode: r.livemode === 1,
   messageId: (r.message_id as number | null) ?? null,
   notifiedAt: (r.notified_at as string | null) ?? null,
   createdAt: r.created_at as string,
@@ -71,9 +74,9 @@ const toPayment = (r: Row): PaymentView => ({
 const PAYMENT_SELECT =
   "SELECT p.*, s.name AS student_name FROM payments p LEFT JOIN students s ON s.id = p.student_id";
 
-const SAVE_EMAIL = `INSERT INTO payer_emails(email, student_id)
+const saveEmailSql = (studentIdSql: string): string => `INSERT INTO payer_emails(email, student_id)
   SELECT customer_email, student_id FROM payments
-  WHERE id = ?1 AND status = 'assigned' AND student_id = ?2 AND customer_email IS NOT NULL
+  WHERE id = ?1 AND status = 'assigned' AND student_id = ${studentIdSql} AND customer_email IS NOT NULL
   ON CONFLICT(email) DO NOTHING`;
 
 export function createStore(db: D1Database): Store {
@@ -135,7 +138,7 @@ export function createStore(db: D1Database): Store {
     async renameStudent(id, name) {
       const clean = normalizeName(name);
       const key = nameKey(clean);
-      await db.prepare("UPDATE OR IGNORE students SET name = ?2, name_key = ?3 WHERE id = ?1").bind(id, clean, key).run();
+      await db.prepare("UPDATE OR IGNORE students SET name = ?1, name_key = ?2 WHERE id = ?3").bind(clean, key, id).run();
       const student = await studentById(id);
       if (student === null) return "not_found";
       return student.nameKey === key ? "ok" : "name_taken";
@@ -145,8 +148,8 @@ export function createStore(db: D1Database): Store {
       await db
         .prepare(
           `INSERT INTO payments(checkout_session_id, status, student_id, amount_minor, currency, customer_name,
-             customer_email, payment_intent_id, payment_link_id, livemode, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             customer_email, payment_intent_id, payment_link_id, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
            ON CONFLICT(checkout_session_id) DO NOTHING`,
         )
         .bind(
@@ -159,7 +162,6 @@ export function createStore(db: D1Database): Store {
           p.customerEmail,
           p.paymentIntentId,
           p.paymentLinkId,
-          p.livemode ? 1 : 0,
           now(),
         )
         .run();
@@ -170,8 +172,8 @@ export function createStore(db: D1Database): Store {
 
     async markNotified(paymentId, messageId) {
       await db
-        .prepare("UPDATE payments SET message_id = ?2, notified_at = ?3 WHERE id = ?1")
-        .bind(paymentId, messageId, now())
+        .prepare("UPDATE payments SET message_id = ?1, notified_at = ?2 WHERE id = ?3")
+        .bind(messageId, now(), paymentId)
         .run();
     },
 
@@ -187,9 +189,9 @@ export function createStore(db: D1Database): Store {
 
       const [update] = await db.batch([
         db
-          .prepare("UPDATE payments SET status = 'assigned', student_id = ?2 WHERE id = ?1 AND status = 'unassigned'")
-          .bind(paymentId, studentId),
-        db.prepare(SAVE_EMAIL).bind(paymentId, studentId),
+          .prepare("UPDATE payments SET status = 'assigned', student_id = ?1 WHERE id = ?2 AND status = 'unassigned'")
+          .bind(studentId, paymentId),
+        db.prepare(saveEmailSql("?2")).bind(paymentId, studentId),
       ]);
       if (update?.meta.changes === 0) {
         const current = await getPayment(paymentId);
@@ -202,51 +204,42 @@ export function createStore(db: D1Database): Store {
       const clean = normalizeName(name);
       const key = nameKey(clean);
 
-      const classify = async (): Promise<AssignOutcome | { kind: "name_taken"; existing: Student } | null> => {
+      const read = async (): Promise<{ payment: PaymentView } | AssignOutcome | { kind: "name_taken"; existing: Student }> => {
         const payment = await getPayment(paymentId);
         if (payment === null) return { kind: "not_found" };
         if (payment.status !== "unassigned") return { kind: "already_resolved", payment };
         const existing = await studentByKey(key);
-        return existing === null ? null : { kind: "name_taken", existing };
+        return existing === null ? { payment } : { kind: "name_taken", existing };
       };
 
-      const early = await classify();
-      if (early !== null) return early;
-      const payment = (await getPayment(paymentId)) as PaymentView;
-      const owner = await emailOwner(payment.customerEmail);
+      const pre = await read();
+      if ("kind" in pre) return pre;
+      const owner = await emailOwner(pre.payment.customerEmail);
 
-      const newStudentId = "(SELECT id FROM students WHERE name_key = ?3)";
       try {
         const [insert] = await db.batch([
           db
             .prepare(
               `INSERT INTO students(name, name_key, created_at)
-               SELECT ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM payments WHERE id = ?1 AND status = 'unassigned')`,
+               SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM payments WHERE id = ?4 AND status = 'unassigned')`,
             )
-            .bind(paymentId, clean, key, now()),
+            .bind(clean, key, now(), paymentId),
           db
             .prepare(
-              `UPDATE payments SET status = 'assigned', student_id = ${newStudentId}
-               WHERE id = ?1 AND status = 'unassigned'`,
+              `UPDATE payments SET status = 'assigned', student_id = (SELECT id FROM students WHERE name_key = ?1)
+               WHERE id = ?2 AND status = 'unassigned'`,
             )
-            .bind(paymentId, clean, key),
-          db
-            .prepare(
-              `INSERT INTO payer_emails(email, student_id)
-               SELECT customer_email, student_id FROM payments
-               WHERE id = ?1 AND status = 'assigned' AND student_id = ${newStudentId} AND customer_email IS NOT NULL
-               ON CONFLICT(email) DO NOTHING`,
-            )
-            .bind(paymentId, clean, key),
+            .bind(key, paymentId),
+          db.prepare(saveEmailSql("(SELECT id FROM students WHERE name_key = ?2)")).bind(paymentId, key),
         ]);
         if (insert?.meta.changes === 0) {
-          const lost = await classify();
-          if (lost !== null) return lost;
+          const lost = await read();
+          if ("kind" in lost) return lost;
           throw new Error("student insert changed nothing");
         }
       } catch (err) {
-        const lost = await classify();
-        if (lost !== null) return lost;
+        const lost = await read();
+        if ("kind" in lost) return lost;
         throw err;
       }
       const created = await studentByKey(key);
@@ -255,12 +248,14 @@ export function createStore(db: D1Database): Store {
 
     async dismissPayment(paymentId) {
       const payment = await getPayment(paymentId);
-      if (payment === null) return "not_found";
-      if (payment.status !== "unassigned") return "already_resolved";
+      if (payment === null) return { kind: "not_found" };
+      if (payment.status !== "unassigned") return { kind: "already_resolved", payment };
       const [update] = await db.batch([
         db.prepare("UPDATE payments SET status = 'dismissed' WHERE id = ?1 AND status = 'unassigned'").bind(paymentId),
       ]);
-      return update?.meta.changes === 0 ? "already_resolved" : "ok";
+      const current = await getPayment(paymentId);
+      if (current === null) return { kind: "not_found" };
+      return update?.meta.changes === 0 ? { kind: "already_resolved", payment: current } : { kind: "dismissed", payment: current };
     },
   };
 }

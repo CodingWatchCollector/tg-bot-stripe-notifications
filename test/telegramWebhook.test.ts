@@ -9,7 +9,7 @@ const CHAT = "-100777";
 const SECRET = "tg_secret";
 const BOT = { id: 999, is_bot: true, first_name: "Tutor", username: "tutor_bot", can_join_groups: true, can_read_all_group_messages: false, supports_inline_queries: false, can_connect_to_business: false, has_main_web_app: false, has_topics_enabled: false, allows_users_to_create_topics: false } as never;
 const LINK = "https://dashboard.stripe.com/payments/pi_123";
-const OLD = `💶 Unknown payer paid 160.00 EUR\nAnna K <anna@example.com>\nWho is this?\n${LINK}`;
+const OLD = `💶 Unknown payer paid 160,00\u00a0€\nAnna K <anna@example.com>\nWho is this?\n${LINK}`;
 
 type Call = { method: string; payload: Record<string, unknown> };
 let fake: D1Fake;
@@ -167,7 +167,7 @@ describe("picking a student", () => {
     expect(edited()?.payload).toMatchObject({
       chat_id: Number(CHAT),
       message_id: 50,
-      text: `💶 Ira + Pasha paid 160.00 EUR\nanna@example.com saved as Ira + Pasha's email\n${LINK}`,
+      text: `💶 Ira + Pasha paid 160,00\u00a0€\nanna@example.com saved as Ira + Pasha's email\n${LINK}`,
       link_preview_options: { is_disabled: true },
     });
     expect(edited()?.payload.reply_markup).toBeUndefined();
@@ -186,14 +186,14 @@ describe("picking a student", () => {
     const id = await seedPayment({ customerEmail: null });
     const ira = addStudent(fake, "Ira");
     await post(tap(`p:${id}:s:${ira}`));
-    expect(edited()?.payload.text).toBe(`💶 Ira paid 160.00 EUR\n${LINK}`);
+    expect(edited()?.payload.text).toBe(`💶 Ira paid 160,00\u00a0€\n${LINK}`);
   });
 
   test("email already theirs -> no second line", async () => {
     const id = await seedPayment();
     const ira = addStudent(fake, "Ira", { emails: ["anna@example.com"] });
     await post(tap(`p:${id}:s:${ira}`));
-    expect(edited()?.payload.text).toBe(`💶 Ira paid 160.00 EUR\n${LINK}`);
+    expect(edited()?.payload.text).toBe(`💶 Ira paid 160,00\u00a0€\n${LINK}`);
   });
 
   test("email owned by another student stays with the owner", async () => {
@@ -201,7 +201,7 @@ describe("picking a student", () => {
     const olena = addStudent(fake, "Olena", { emails: ["anna@example.com"] });
     const ira = addStudent(fake, "Ira + Pasha");
     await post(tap(`p:${id}:s:${ira}`));
-    expect(edited()?.payload.text).toBe(`💶 Ira + Pasha paid 160.00 EUR\nanna@example.com already belongs to Olena\n${LINK}`);
+    expect(edited()?.payload.text).toBe(`💶 Ira + Pasha paid 160,00\u00a0€\nanna@example.com already belongs to Olena\n${LINK}`);
     expect(fake.raw.all("SELECT student_id FROM payer_emails")).toEqual([{ student_id: olena }]);
     expect(fake.raw.all("SELECT student_id FROM payments")).toEqual([{ student_id: ira }]);
   });
@@ -214,7 +214,7 @@ describe("cancel", () => {
     expect(methods()).toEqual(["answerCallbackQuery", "editMessageText"]);
     expect(calls[0]?.payload.text).toBeUndefined();
     expect(edited()?.payload).toMatchObject({
-      text: `💶 Payment dismissed: 160.00 EUR\nAnna K <anna@example.com>\n${LINK}`,
+      text: `💶 Payment dismissed: 160,00\u00a0€\nAnna K <anna@example.com>\n${LINK}`,
       link_preview_options: { is_disabled: true },
     });
     expect(fake.raw.all("SELECT status FROM payments")).toEqual([{ status: "dismissed" }]);
@@ -230,7 +230,7 @@ describe("stale and unknown taps", () => {
     const res = await post(tap(`p:${id}:x`));
     expect(res.status).toBe(200);
     expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
-    expect(edited()?.payload.text).toBe(`💶 Payment dismissed: 160.00 EUR\nAnna K <anna@example.com>\n${LINK}`);
+    expect(edited()?.payload.text).toBe(`💶 Payment dismissed: 160,00\u00a0€\nAnna K <anna@example.com>\n${LINK}`);
     expect(logged().filter((a) => String(a).includes("failed"))).toHaveLength(0);
   });
 
@@ -242,7 +242,7 @@ describe("stale and unknown taps", () => {
     calls.length = 0;
     await post(tap(`p:${id}:s:${olena}`));
     expect(calls[0]?.payload.text).toBe("Already handled");
-    expect(edited()?.payload).toMatchObject({ text: `💶 Ira paid 160.00 EUR\n${LINK}`, link_preview_options: { is_disabled: true } });
+    expect(edited()?.payload).toMatchObject({ text: `💶 Ira paid 160,00\u00a0€\n${LINK}`, link_preview_options: { is_disabled: true } });
     expect(fake.raw.all("SELECT student_id FROM payments")).toEqual([{ student_id: ira }]);
     expect(dump()[0]?.e).toBe(1);
   });
@@ -311,7 +311,7 @@ describe("new student", () => {
     expect(edited()?.payload).toMatchObject({
       chat_id: CHAT,
       message_id: 50,
-      text: `💶 Marie Curie paid 160.00 EUR\nanna@example.com saved as Marie Curie's email\n${LINK}`,
+      text: `💶 Marie Curie paid 160,00\u00a0€\nanna@example.com saved as Marie Curie's email\n${LINK}`,
       link_preview_options: { is_disabled: true },
     });
     expect(calls[1]?.payload.text).toBe("Added Marie Curie.");

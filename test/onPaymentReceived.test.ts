@@ -25,7 +25,7 @@ describe("makeOnPaymentReceived", () => {
     const { send, run } = setup();
     await run(payment);
     expect(send).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledWith(`💶 Olena paid 160.00 EUR\n${LINK}`);
+    expect(send).toHaveBeenCalledWith(`💶 Olena paid 160,00\u00a0€\n${LINK}`);
     expect(payments()).toMatchObject([{ status: "assigned", message_id: 9 }]);
     expect(payments()[0]?.notified_at).not.toBeNull();
   });
@@ -35,7 +35,7 @@ describe("makeOnPaymentReceived", () => {
     const { send, run } = setup();
     await run(payment);
     expect(send).toHaveBeenCalledWith(
-      `💶 Unknown payer paid 160.00 EUR\nAnna K <anna@example.com>\nWho is this?\n${LINK}`,
+      `💶 Unknown payer paid 160,00\u00a0€\nAnna K <anna@example.com>\nWho is this?\n${LINK}`,
       { buttons: expect.any(Array) },
     );
     expect(payments()).toMatchObject([{ status: "unassigned", message_id: 9 }]);

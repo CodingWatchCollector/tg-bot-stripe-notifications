@@ -10,9 +10,11 @@ describe("toPaymentReceived", () => {
     expect(toPaymentReceived(paidEvent())).toEqual(expectedPayment);
   });
 
-  test("livemode comes from the event", () => {
+  test("an event with livemode false maps to the same payment", () => {
     const event = sessionEvent("checkout.session.completed", {}, { livemode: false });
-    expect(toPaymentReceived(event)?.livemode).toBe(false);
+    const mapped = toPaymentReceived(event);
+    expect(mapped).not.toHaveProperty("livemode");
+    expect(mapped).toEqual(expectedPayment);
   });
 
   test("async_payment_succeeded is mapped too", () => {

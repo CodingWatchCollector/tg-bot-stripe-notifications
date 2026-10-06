@@ -8,7 +8,7 @@ import {
   unknownPayerText,
   type EmailOutcome,
 } from "../app/messages";
-import type { AssignOutcome, PaymentView, Store } from "../db/store";
+import type { AssignOutcome, DismissOutcome, PaymentView, Store } from "../db/store";
 import { isValidName, nameKey, normalizeName } from "../domain/student";
 
 const INVALID_NAME = "Name must be 1-64 characters.";
@@ -97,26 +97,24 @@ export function createBot(opts: BotOptions): Bot {
     if (m === null) return void (await answer("Not found"));
     const paymentId = Number(m[1]);
 
-    const finish = async (outcome: AssignOutcome | "ok" | "already_resolved" | "not_found") => {
-      if (outcome === "not_found" || (typeof outcome === "object" && outcome.kind === "not_found")) {
-        return answer("Not found");
+    const finish = async (outcome: AssignOutcome | DismissOutcome) => {
+      switch (outcome.kind) {
+        case "not_found":
+          return answer("Not found");
+        case "already_resolved":
+          await answer("Already handled");
+          return edit(currentText(outcome.payment));
+        case "assigned":
+          await answer();
+          return edit(currentText(outcome.payment, outcome.email));
+        case "dismissed":
+          await answer();
+          return edit(currentText(outcome.payment));
+        default: {
+          const unreachable: never = outcome;
+          return unreachable;
+        }
       }
-      if (outcome === "ok") {
-        await answer();
-        const p = await store.getPayment(paymentId);
-        return p === null ? undefined : edit(currentText(p));
-      }
-      if (outcome === "already_resolved") {
-        await answer("Already handled");
-        const p = await store.getPayment(paymentId);
-        return p === null ? undefined : edit(currentText(p));
-      }
-      if (outcome.kind === "already_resolved") {
-        await answer("Already handled");
-        return edit(currentText(outcome.payment));
-      }
-      await answer();
-      return edit(currentText(outcome.payment, outcome.email));
     };
 
     if (m[2] !== undefined) return finish(await store.assignPayment(paymentId, Number(m[2])));
