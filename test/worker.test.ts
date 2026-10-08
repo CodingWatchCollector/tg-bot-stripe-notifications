@@ -6,7 +6,8 @@ import type { Env } from "../src/config";
 import { createWorker } from "../src/worker";
 import { paidEvent, sessionEvent } from "./fixtures";
 import { createD1Fake, type D1Fake } from "./support/d1";
-import { addStudent } from "./support/seed";
+import { createStore } from "../src/db/store";
+import { PRODUCTS_FIXTURE, addAdjustment, addStudent } from "./support/seed";
 
 const FULL_ENV = {
   STRIPE_WEBHOOK_SECRET: "whsec_ac20secret",
@@ -208,7 +209,10 @@ async function deliver(
     { amount_total: 16000, ...session },
     { ...(opts.id && { id: opts.id }), ...(opts.livemode !== undefined && { livemode: opts.livemode }) },
   );
-  const res = await createWorker({ makeNotifier, makeBot }).fetch(await signedPaid(FULL_ENV.STRIPE_WEBHOOK_SECRET, event), env());
+  const res = await createWorker({ makeNotifier, makeBot, products: PRODUCTS_FIXTURE }).fetch(
+    await signedPaid(FULL_ENV.STRIPE_WEBHOOK_SECRET, event),
+    env(),
+  );
   return { res, calls: recorded.calls };
 }
 
@@ -338,5 +342,138 @@ describe("Stripe delivery", () => {
     await deliver({ payment_status: "unpaid" });
     await deliver({}, { type: "payment_intent.succeeded" });
     expect(rows()).toHaveLength(0);
+  });
+});
+
+describe("Stripe delivery with products", () => {
+  const T4 = "Індивідуальний пакет 4";
+  const CLUB = "Клуб B2/C1 — поурочно";
+  const EUR = "160,00\u00a0€";
+  const olenaPayer = { customer_details: { name: "Whoever", email: "olena@example.com" } };
+  const balances = async () => Object.fromEntries((await createStore(fake.d1).listStudentBalances()).map((b) => [b.name, b.balance]));
+  const keyboard = (pid: number) => ({
+    inline_keyboard: [[{ text: "-1", callback_data: `p:${pid}:-1` }, { text: "+1", callback_data: `p:${pid}:+1` }]],
+  });
+  const seedOlena = (balance = 1) => {
+    const id = addStudent(fake, "Olena", { emails: ["olena@example.com"] });
+    if (balance !== 0) addAdjustment(fake, id, balance);
+    return id;
+  };
+  const paymentRows = () => fake.raw.all("SELECT id, status, lessons, product_name, message_id, notified_at FROM payments ORDER BY id");
+
+  test("a Pack from a known payer is announced with the Balance and correction buttons", async () => {
+    seedOlena();
+    const { res, calls } = await deliver({ ...olenaPayer, payment_link: "plink_t4" });
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.payload.text).toBe(`💶 Olena paid for 4 lessons (${T4}, ${EUR})\nBalance: 1 → 5\n${LINK}`);
+    expect(calls[0]?.payload.reply_markup).toEqual(keyboard(1));
+    expect(paymentRows()).toMatchObject([{ status: "assigned", lessons: 4, product_name: T4, message_id: 55 }]);
+    expect(paymentRows()[0]?.notified_at).not.toBeNull();
+    expect((await balances()).Olena).toBe(5);
+  });
+
+  test("a single lesson is singular", async () => {
+    seedOlena();
+    const { calls } = await deliver({ ...olenaPayer, payment_link: "plink_t1" });
+    expect(calls[0]?.payload.text).toBe(`💶 Olena paid for 1 lesson (Індивідуальне — поурочно, ${EUR})\nBalance: 1 → 2\n${LINK}`);
+  });
+
+  test("Individual and Duo Packs credit one Balance", async () => {
+    addStudent(fake, "Ira + Pasha", { emails: ["ira@example.com"] });
+    const ira = { customer_details: { name: "Ira", email: "ira@example.com" } };
+    const first = await deliver({ ...ira, payment_link: "plink_d4" });
+    const second = await deliver({ ...ira, payment_link: "plink_t1", id: "cs_test_2" });
+    expect(first.calls[0]?.payload.text).toBe(`💶 Ira + Pasha paid for 4 lessons (Duo — пакет 4, ${EUR})\nBalance: 0 → 4\n${LINK}`);
+    expect(String(second.calls[0]?.payload.text)).toContain("\nBalance: 4 → 5\n");
+    expect((await balances())["Ira + Pasha"]).toBe(5);
+  });
+
+  test("a name-only product is announced by name and leaves the Balance alone", async () => {
+    seedOlena();
+    const { calls } = await deliver({ ...olenaPayer, payment_link: "plink_club" });
+    expect(calls[0]?.payload.text).toBe(`💶 Olena paid ${EUR} for ${CLUB}\n${LINK}`);
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+    expect(paymentRows()).toMatchObject([{ status: "assigned", lessons: 0, product_name: CLUB }]);
+    expect((await balances()).Olena).toBe(1);
+  });
+
+  test.each([
+    ["no link", {}],
+    ["a link outside the table", { payment_link: "plink_other" }],
+  ])("%s keeps today's text", async (_n, link) => {
+    seedOlena();
+    const { calls } = await deliver({ ...olenaPayer, ...link });
+    expect(calls[0]?.payload.text).toBe(`💶 Olena paid ${EUR}\n${LINK}`);
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+    expect(paymentRows()).toMatchObject([{ lessons: 0, product_name: null }]);
+    expect((await balances()).Olena).toBe(1);
+  });
+
+  test.each([
+    ["a name-only product", { payment_link: "plink_club" }],
+    ["no link", {}],
+  ])("an archived payer with %s stays archived with no unarchive line", async (_n, link) => {
+    addStudent(fake, "Old One", { emails: ["old@example.com"], archived: true });
+    const { calls } = await deliver({ customer_details: { name: "X", email: "old@example.com" }, ...link });
+    expect(String(calls[0]?.payload.text)).not.toContain("active again");
+    expect(String(calls[0]?.payload.text).startsWith("💶 Old One paid")).toBe(true);
+    expect(fake.raw.all("SELECT archived FROM students")).toEqual([{ archived: 1 }]);
+  });
+
+  test.each(["checkout.session.completed", "checkout.session.async_payment_succeeded"])(
+    "a repeat delivery (%s) never credits twice",
+    async (type) => {
+      seedOlena();
+      await deliver({ ...olenaPayer, payment_link: "plink_t4" });
+      const again = await deliver({ ...olenaPayer, payment_link: "plink_t4" }, { type, id: "evt_2" });
+      expect(again.res.status).toBe(200);
+      expect(again.calls).toHaveLength(0);
+      expect(paymentRows()).toHaveLength(1);
+      expect((await balances()).Olena).toBe(5);
+    },
+  );
+
+  test("a delivery after a failed send announces the Balance once and credits once", async () => {
+    seedOlena();
+    const failing = recordingApi(() => ({ ok: false, error_code: 500, description: "boom" }));
+    const first = await deliver({ ...olenaPayer, payment_link: "plink_t4" }, { api: failing.api });
+    expect(first.res.status).toBe(500);
+    expect(await first.res.json()).toEqual({ error: "processing failed" });
+    expect(paymentRows()[0]?.notified_at).toBeNull();
+    const second = await deliver({ ...olenaPayer, payment_link: "plink_t4" });
+    expect(second.calls).toHaveLength(1);
+    expect(String(second.calls[0]?.payload.text)).toContain("\nBalance: 1 → 5\n");
+    expect((await balances()).Olena).toBe(5);
+  });
+
+  test.each([
+    ["a Pack", { payment_link: "plink_t4" }, `💶 Unknown payer paid for 4 lessons (${T4}, ${EUR})`, 4],
+    ["a name-only product", { payment_link: "plink_club" }, `💶 Unknown payer paid ${EUR} for ${CLUB}`, 0],
+    ["no link", {}, `💶 Unknown payer paid ${EUR}`, 0],
+  ])("an unknown payer with %s gets the picker and no Credit", async (_n, link, first, lessons) => {
+    addStudent(fake, "Olena", { emails: ["olena@example.com"] });
+    const { calls } = await deliver(link);
+    expect(calls[0]?.payload.text).toBe(`${first}\nAnna K <anna@example.com>\nWho is this?\n${LINK}`);
+    expect(calls[0]?.payload.reply_markup).toBeDefined();
+    expect(paymentRows()).toMatchObject([{ status: "unassigned", lessons }]);
+    expect(await balances()).toEqual({ Olena: 0 });
+  });
+
+  test("a Pack from an archived payer credits and unarchives in one batch", async () => {
+    const oldOne = addStudent(fake, "Old One", { emails: ["old@example.com"], archived: true });
+    const batch = vi.spyOn(fake, "batch");
+    const { calls } = await deliver({ customer_details: { name: "X", email: "old@example.com" }, payment_link: "plink_t4" });
+    expect(calls[0]?.payload.text).toBe(
+      `💶 Old One paid for 4 lessons (${T4}, ${EUR})\nOld One was archived and is active again.\nBalance: 0 → 4\n${LINK}`,
+    );
+    expect(calls[0]?.payload.reply_markup).toEqual(keyboard(1));
+    expect(fake.raw.all("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+    expect((await createStore(fake.d1).listActiveStudents()).map((s) => s.id)).toEqual([oldOne]);
+    expect(batch).toHaveBeenCalledTimes(1);
+    const sql = (batch.mock.calls[0]?.[0] as unknown as { sql: string }[]).map((st) => st.sql);
+    expect(sql).toHaveLength(2);
+    expect(sql[0]).toContain("INSERT INTO payments");
+    expect(sql[1]).toContain("UPDATE students SET archived = 0");
   });
 });

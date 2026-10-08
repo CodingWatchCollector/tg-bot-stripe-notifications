@@ -16,7 +16,11 @@ const collator = new Intl.Collator("en", { sensitivity: "base" });
 export const compareNames = (a: { id: number; name: string }, b: { id: number; name: string }): number =>
   collator.compare(a.name, b.name) || a.id - b.id;
 
-export function isValidName(s: string): boolean {
+const hasLength = (s: string, max: number): boolean => {
   const length = [...normalizeName(s)].length;
-  return length >= 1 && length <= 64;
-}
+  return length >= 1 && length <= max;
+};
+
+export const isValidName = (s: string): boolean => hasLength(s, 64);
+
+export const isValidReason = (s: string): boolean => hasLength(s, 200);

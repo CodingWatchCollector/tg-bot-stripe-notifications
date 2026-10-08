@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import first from "../../migrations/0001_students_payments.sql?raw";
 import second from "../../migrations/0002_drop_payments_livemode.sql?raw";
+import third from "../../migrations/0003_balances.sql?raw";
 
 type Value = string | number | bigint | null;
 type Row = Record<string, Value>;
@@ -17,6 +18,7 @@ export function createD1Fake() {
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(first);
   db.exec(second);
+  db.exec(third);
   let failing: Method | "any" | null = null;
   let beforeBatch: (() => void) | null = null;
 

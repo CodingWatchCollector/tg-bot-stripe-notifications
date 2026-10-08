@@ -1,3 +1,4 @@
+import type { PaymentView, StudentSummary } from "../db/store";
 import { compareNames, nameKey, type Student } from "../domain/student";
 import type { Button } from "../notify/notifier";
 
@@ -7,9 +8,16 @@ export interface PaymentFacts {
   customerName: string | null;
   customerEmail: string | null;
   paymentIntentId: string | null;
+  lessons?: number;
+  productName?: string | null;
 }
 
 export type EmailOutcome = "saved" | "none" | { ownedBy: { name: string } };
+export interface PaymentNotes {
+  email?: EmailOutcome;
+  unarchived?: boolean;
+}
+export type { StudentSummary } from "../db/store";
 
 export function formatAmount(amountMinor: number | null, currency: string | null): string {
   if (amountMinor === null || currency === null) return "amount unknown";
@@ -27,26 +35,71 @@ const withLink = (lines: string[], p: PaymentFacts): string => {
   return (link === null ? lines : [...lines, link]).join("\n");
 };
 
-export const knownPayerText = (studentName: string, p: PaymentFacts): string =>
-  withLink([`💶 ${studentName} paid ${formatAmount(p.amountMinor, p.currency)}`], p);
+const isPack = (p: PaymentFacts): boolean => (p.lessons ?? 0) > 0;
+
+const unarchivedLine = (name: string): string => `${name} was archived and is active again.`;
+
+const lessonCount = (n: number): string => (n === 1 ? "1 lesson" : `${n} lessons`);
+
+export function paidPhrase(p: PaymentFacts): string {
+  const amount = formatAmount(p.amountMinor, p.currency);
+  if (isPack(p)) return `paid for ${lessonCount(p.lessons ?? 0)} (${p.productName ?? "unknown product"}, ${amount})`;
+  if ((p.productName ?? null) !== null) return `paid ${amount} for ${p.productName}`;
+  return `paid ${amount}`;
+}
+
+const emailLine = (studentName: string, p: PaymentFacts, email: EmailOutcome): string | null => {
+  if (p.customerEmail === null) return null;
+  if (email === "saved") return `${p.customerEmail} saved as ${studentName}'s email`;
+  if (typeof email === "object") return `${p.customerEmail} already belongs to ${email.ownedBy.name}`;
+  return null;
+};
+
+const signed = (n: number): string => (n > 0 ? `+${n}` : String(n));
 
 export function assignedText(studentName: string, p: PaymentFacts, email: EmailOutcome = "none"): string {
-  const lines = [`💶 ${studentName} paid ${formatAmount(p.amountMinor, p.currency)}`];
-  if (p.customerEmail !== null && email === "saved") lines.push(`${p.customerEmail} saved as ${studentName}'s email`);
-  if (p.customerEmail !== null && typeof email === "object") {
-    lines.push(`${p.customerEmail} already belongs to ${email.ownedBy.name}`);
-  }
+  const lines = [`💶 ${studentName} ${paidPhrase(p)}`];
+  const note = emailLine(studentName, p, email);
+  if (note !== null) lines.push(note);
   return withLink(lines, p);
 }
 
 export const unknownPayerText = (p: PaymentFacts): string =>
-  withLink(
-    [`💶 Unknown payer paid ${formatAmount(p.amountMinor, p.currency)}`, customerLine(p), "Who is this?"],
-    p,
-  );
+  withLink([`💶 Unknown payer ${paidPhrase(p)}`, customerLine(p), "Who is this?"], p);
 
-export const dismissedText = (p: PaymentFacts): string =>
-  withLink([`💶 Payment dismissed: ${formatAmount(p.amountMinor, p.currency)}`, customerLine(p)], p);
+export const dismissedText = (p: PaymentFacts): string => {
+  const product = p.productName ?? null;
+  const header = `💶 Payment dismissed: ${formatAmount(p.amountMinor, p.currency)}${product === null ? "" : ` for ${product}`}`;
+  return withLink([header, customerLine(p)], p);
+};
+
+export const paymentButtons = (paymentId: number): Button[][] => [
+  [
+    { text: "-1", data: `p:${paymentId}:-1` },
+    { text: "+1", data: `p:${paymentId}:+1` },
+  ],
+];
+
+export function paymentMessage(view: PaymentView, notes: PaymentNotes = {}): { text: string; buttons?: Button[][] } {
+  switch (view.status) {
+    case "dismissed":
+      return { text: dismissedText(view) };
+    case "unassigned":
+      return { text: unknownPayerText(view) };
+    case "assigned": {
+      const name = view.studentName ?? "unknown";
+      if (!isPack(view)) return { text: assignedText(name, view, notes.email ?? "none") };
+      if (view.studentBalance === null) throw new Error("assigned payment without balance");
+      const lines = [`💶 ${name} ${paidPhrase(view)}`];
+      const note = emailLine(name, view, notes.email ?? "none");
+      if (note !== null) lines.push(note);
+      if (notes.unarchived === true) lines.push(unarchivedLine(name));
+      if (view.correction !== 0) lines.push(`Correction: ${signed(view.correction)}`);
+      lines.push(`Balance: ${view.studentBalance - view.lessons - view.correction} → ${view.studentBalance}`);
+      return { text: withLink(lines, view), buttons: paymentButtons(view.id) };
+    }
+  }
+}
 
 const MAX_STUDENT_BUTTONS = 90;
 
@@ -68,9 +121,13 @@ export function pickerButtons(paymentId: number, students: Student[], customerNa
   return rows;
 }
 
-export const studentsText = (students: Student[]): string =>
+export const studentsText = (students: StudentSummary[]): string =>
   students.length === 0
     ? "No students yet."
-    : [`Students (${students.length}):`, ...[...students].sort(compareNames).map((s) => s.name)].join("\n");
+    : [`Students (${students.length}):`, ...[...students].sort(compareNames).map((s) => `${s.name}: ${s.balance}`)].join("\n");
+
+export const adjustText = (name: string, delta: number, reason: string, before: number, after: number, unarchived: boolean): string =>
+  `${name}: ${signed(delta)} (${reason}). Balance: ${before} → ${after}` +
+  (unarchived ? `\n${unarchivedLine(name)}` : "");
 
 export const newStudentPrompt = (paymentId: number): string => `Name for the new student (payment #${paymentId}):`;

@@ -2,7 +2,8 @@
 
 A Cloudflare Worker that tells you in Telegram when a customer pays through Stripe Checkout or a Payment Link, and
 remembers who pays. It keeps Students and their Payer emails in a D1 database, announces each payment with the Student's
-name, and lets you attach a payment from an unknown email to a Student (or dismiss it) with buttons in the chat.
+name, and lets you attach a payment from an unknown email to a Student (or dismiss it) with buttons in the chat. Each
+Student has a Balance of lessons: Pack Payments add to it and you correct it by hand.
 
 It has two endpoints:
 
@@ -19,23 +20,55 @@ afterwards), because delivery is at least once.
 Plain text, with the amount and a link to the payment in the Stripe dashboard (the link line is left out when the payment
 has no payment intent):
 
-- Known Payer: `💶 Olena paid 160,00 €`
-- Unknown Payer: `💶 Unknown payer paid 160,00 €`, then `Anna K <anna@example.com>` and `Who is this?`, with buttons:
+- Known Payer, Pack (Individual and Duo): the lesson count, the product and the Balance before and after, with `-1` and `+1`
+  buttons:
+  ```
+  💶 Olena paid for 4 lessons (Індивідуальний пакет 4, 160,00 €)
+  Balance: 1 → 5
+  ```
+  One lesson reads `paid for 1 lesson (...)`.
+- Known Payer, Club and Book club: `💶 Olena paid 14,00 € for Клуб B2/C1 — поурочно`. The Balance is left alone and there are no buttons.
+- A payment whose Payment Link is not in the products table keeps the plain text: `💶 Olena paid 160,00 €`.
+- Unknown Payer: `💶 Unknown payer paid 160,00 €` (or `paid for 4 lessons (...)` / `paid 14,00 € for <product>`), then
+  `Anna K <anna@example.com>` and `Who is this?`, with buttons:
   `➕ New student`, a `💡 <name>` row when the Stripe customer name matches a Student, the active Students two per
   row (at most 90), and `✖️ Cancel`.
 - Tapping a Student assigns the payment, saves the email as theirs and edits the message to
   `<email> saved as <name>'s email`. If the email already belongs to another Student, the payment still goes to the tapped
-  Student and the message says `<email> already belongs to <owner>`.
-- `✖️ Cancel` dismisses the payment: `💶 Payment dismissed: 160,00 €`.
+  Student and the message says `<email> already belongs to <owner>`. A Pack assigned this way credits the Student and the
+  edited message shows the Balance line and the `-1` and `+1` buttons.
+- `✖️ Cancel` dismisses the payment: `💶 Payment dismissed: 160,00 €` (with ` for <product>` when the link is known). A
+  dismissed payment credits nothing.
 - `➕ New student` asks for a name (reply to the bot's prompt). Names are 1-64 characters and unique ignoring case.
 - A second tap on a handled payment is answered `Already handled`.
+- `-1` and `+1` on a Pack message record a correction (reason `payment correction`) and edit the message in place. The
+  Balance line is recomputed from the ledger every time, never read from the message: `before` is the Balance without this
+  Payment, `after` the Balance now. When the taps on one Payment do not net to zero the message also shows `Correction: +1`.
+  The buttons keep working on old messages and never unarchive a Student.
+- A Pack Payment from an archived Student's email, or a Pack assigned to an archived Student with the picker, makes the
+  Student active again and the message says `<name> was archived and is active again.` Club, Book club and unlisted
+  payments leave an archived Student archived.
 
 Commands, in the configured chat only (updates from other chats are ignored):
 
-- `/students` lists the active Students.
+- `/students` lists the active Students with their Balance: `Olena: 5`.
+- `/adjust <name> <count> [reason]` adds an Adjustment to a Student's Balance. The count is 1-99, `+` or no sign adds and
+  `-` subtracts; the reason is optional (stored as `-` when omitted), otherwise 1-200 characters, and is stored with the Adjustment. The name may contain spaces and numbers
+  (the longest name that matches a Student wins). Examples: `/adjust Olena +5 opening balance` replies
+  `Olena: +5 (opening balance). Balance: 0 → 5`; `/adjust Ira + Pasha -1 missed lesson` subtracts one. Adjusting an
+  archived Student makes them active again and the reply adds the line `<name> was archived and is active again.` At most
+  10 numbers may appear in the command, otherwise the bot answers with the usage line. Adjustments are never overwritten.
 - `/rename Old name -> New name` renames a Student. Earlier messages are not edited.
 
 If Telegram privacy mode is on for the bot and a bare command gets no answer, send `/students@<bot username>` instead.
+
+## Products
+
+The 8 live Payment Link ids live in `src/domain/products.ts`, each with its name and, for Packs, its lesson count.
+Individual (1, 4, 8 lessons) and Duo (1, 4 lessons) products are Packs and credit the Student's Balance (a Duo couple is one
+Student). Club and Book club products are shown by name only. Changing the table is a code change plus `pnpm run deploy`.
+The id is the `plink_...` id from the Stripe dashboard (Payment Links), not the `buy.stripe.com` URL. Payments made through
+`stripe listen` come from test links that are not in the table, so they render as unlisted.
 
 ## Setup
 
@@ -82,10 +115,18 @@ Run these in order:
 3. Apply the pending migrations: `pnpm exec wrangler d1 migrations apply tg-bot --remote`.
 4. Deploy right away: `pnpm run deploy`.
 
-Between steps 3 and 4 Stripe deliveries fail with 500 and Stripe retries them; the retry is safe because payments are
-deduplicated by checkout session id. Telegram edits made by the old code in that window show a `/test/` dashboard link.
+0002 dropped a column, so between migrating and deploying the old code failed every Stripe delivery (Stripe retried; dedupe by checkout session id made that safe) and showed `/test/` dashboard links. 0003 only adds columns and a table: the running Worker keeps working between steps 3 and 4.
 Never deploy before migrating: the new code then fails every Stripe delivery. A dropped column can only be restored with
 D1 Time Travel together with a code revert.
+
+v2.1b-1 note: Pack Payments recorded before the v2.1b-1 deploy (including any that arrive between steps 3 and 4) are not
+credited. Set opening Balances with `/adjust Name +N opening balance`.
+
+### Reconciling with Notion
+
+To compare a Student's Balance with your own notes, list their ledger:
+`pnpm exec wrangler d1 execute tg-bot --remote --command "SELECT delta, reason, payment_id, created_at FROM adjustments WHERE student_id = (SELECT id FROM students WHERE name = 'Olena') ORDER BY id"`.
+The Balance is the sum of that column plus the lessons of the Student's assigned Pack Payments.
 
 ## Local development
 
@@ -125,6 +166,8 @@ exported in your shell win over `.dev.vars`.
   `getWebhookInfo` shows `last_error_message` (a 401 from the Worker).
 - If the group is upgraded to a supergroup its chat id changes and the bot ignores it (the log says
   `telegram update from other chat ignored:`) until `TELEGRAM_CHAT_ID` is updated.
+- A Pack is announced without lessons or a product name: compare the id in `src/domain/products.ts` with
+  `pnpm exec wrangler d1 execute tg-bot --remote --command "SELECT payment_link_id, product_name, lessons FROM payments ORDER BY id DESC LIMIT 5"`.
 - Do not enable tracing in `wrangler.jsonc`: spans would record the Telegram URL, which contains the bot token.
 
 ## Development

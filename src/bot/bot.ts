@@ -1,19 +1,16 @@
 import { Bot, GrammyError, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
-import {
-  assignedText,
-  dismissedText,
-  newStudentPrompt,
-  studentsText,
-  unknownPayerText,
-  type EmailOutcome,
-} from "../app/messages";
-import type { AssignOutcome, DismissOutcome, PaymentView, Store } from "../db/store";
-import { isValidName, nameKey, normalizeName } from "../domain/student";
+import { adjustText, newStudentPrompt, paymentMessage, studentsText } from "../app/messages";
+import type { AssignOutcome, DismissOutcome, Store } from "../db/store";
+import { isValidName, isValidReason, nameKey, normalizeName } from "../domain/student";
+import type { Button } from "../notify/notifier";
 
 const INVALID_NAME = "Name must be 1-64 characters.";
 const PROMPT = /^Name for the new student \(payment #(\d+)\):$/;
-const CALLBACK = /^p:(\d+):(?:s:(\d+)|(new)|(x))$/;
+const CALLBACK = /^p:(\d+):(?:s:(\d+)|(new)|(x)|([+-]1))$/;
+const COUNT = /^[+-]?\d+$/;
+const MAX_ADJUST_CANDIDATES = 10;
+const ADJUST_USAGE = "Usage: /adjust Name +5 [reason]";
 const NO_PREVIEW = { link_preview_options: { is_disabled: true } } as const;
 
 export interface BotOptions {
@@ -24,10 +21,27 @@ export interface BotOptions {
   fetch?: typeof fetch;
 }
 
-function currentText(p: PaymentView, email: EmailOutcome = "none"): string {
-  if (p.status === "assigned") return assignedText(p.studentName ?? "unknown", p, email);
-  if (p.status === "dismissed") return dismissedText(p);
-  return unknownPayerText(p);
+const inlineKeyboard = (buttons: Button[][]) => ({
+  inline_keyboard: buttons.map((row) => row.map((b) => ({ text: b.text, callback_data: b.data }))),
+});
+
+const editOptions = (buttons?: Button[][]) => ({ ...NO_PREVIEW, ...(buttons && { reply_markup: inlineKeyboard(buttons) }) });
+
+interface AdjustCandidate {
+  name: string;
+  count: string;
+  reason: string;
+}
+
+// Every count token after the first is a possible split of "<name> <count> <reason>". The reason is optional and defaults to "-".
+function adjustCandidates(arg: string): AdjustCandidate[] {
+  const tokens = normalizeName(arg).split(" ").filter((t) => t !== "");
+  const out: AdjustCandidate[] = [];
+  for (let i = 1; i < tokens.length; i++) {
+    const count = tokens[i] ?? "";
+    if (COUNT.test(count)) out.push({ name: tokens.slice(0, i).join(" "), count, reason: tokens.slice(i + 1).join(" ") || "-" });
+  }
+  return out;
 }
 
 async function editTolerant(edit: () => Promise<unknown>): Promise<void> {
@@ -55,7 +69,33 @@ export function createBot(opts: BotOptions): Bot {
   });
 
   bot.command("students", async (ctx) => {
-    await ctx.reply(studentsText(await store.listActiveStudents()));
+    await ctx.reply(studentsText(await store.listStudentBalances()));
+  });
+
+  bot.command("adjust", async (ctx) => {
+    const candidates = adjustCandidates(ctx.match);
+    const leftmost = candidates[0];
+    if (leftmost === undefined || candidates.length > MAX_ADJUST_CANDIDATES) return void (await ctx.reply(ADJUST_USAGE));
+
+    for (const c of [...candidates].reverse()) {
+      const student = await store.findStudentByNameKey(nameKey(c.name));
+      if (student === null) continue;
+      const delta = Number(c.count);
+      if (delta === 0 || Math.abs(delta) > 99) return void (await ctx.reply("Count must be 1-99."));
+      if (!isValidReason(c.reason)) return void (await ctx.reply("Reason must be 1-200 characters."));
+      const outcome = await store.adjustStudent(student.id, delta, c.reason);
+      switch (outcome.kind) {
+        case "not_found":
+          return void (await ctx.reply(`No student named ${c.name}.`));
+        case "adjusted":
+          return void (await ctx.reply(adjustText(outcome.student.name, delta, c.reason, outcome.before, outcome.after, outcome.unarchived)));
+        default: {
+          const unreachable: never = outcome;
+          return unreachable;
+        }
+      }
+    }
+    await ctx.reply(`No student named ${leftmost.name}.`);
   });
 
   bot.command("rename", async (ctx) => {
@@ -90,8 +130,8 @@ export function createBot(opts: BotOptions): Bot {
     };
     const message = ctx.callbackQuery.message;
     if (message === undefined) return;
-    const edit = (text: string) =>
-      editTolerant(() => ctx.api.editMessageText(message.chat.id, message.message_id, text, NO_PREVIEW));
+    const edit = ({ text, buttons }: { text: string; buttons?: Button[][] }) =>
+      editTolerant(() => ctx.api.editMessageText(message.chat.id, message.message_id, text, editOptions(buttons)));
 
     const m = CALLBACK.exec(ctx.callbackQuery.data);
     if (m === null) return void (await answer("Not found"));
@@ -103,13 +143,13 @@ export function createBot(opts: BotOptions): Bot {
           return answer("Not found");
         case "already_resolved":
           await answer("Already handled");
-          return edit(currentText(outcome.payment));
+          return edit(paymentMessage(outcome.payment));
         case "assigned":
           await answer();
-          return edit(currentText(outcome.payment, outcome.email));
+          return edit(paymentMessage(outcome.payment, { email: outcome.email, unarchived: outcome.unarchived }));
         case "dismissed":
           await answer();
-          return edit(currentText(outcome.payment));
+          return edit(paymentMessage(outcome.payment));
         default: {
           const unreachable: never = outcome;
           return unreachable;
@@ -119,6 +159,20 @@ export function createBot(opts: BotOptions): Bot {
 
     if (m[2] !== undefined) return finish(await store.assignPayment(paymentId, Number(m[2])));
     if (m[4] !== undefined) return finish(await store.dismissPayment(paymentId));
+    if (m[5] !== undefined) {
+      const outcome = await store.adjustPayment(paymentId, m[5] === "+1" ? 1 : -1);
+      switch (outcome.kind) {
+        case "not_found":
+          return answer("Not found");
+        case "adjusted":
+          await answer();
+          return edit(paymentMessage(outcome.payment));
+        default: {
+          const unreachable: never = outcome;
+          return unreachable;
+        }
+      }
+    }
 
     const payment = await store.getPayment(paymentId);
     if (payment === null) return void (await answer("Not found"));
@@ -148,9 +202,8 @@ export function createBot(opts: BotOptions): Bot {
       case "assigned": {
         const { messageId } = outcome.payment;
         if (messageId !== null) {
-          await editTolerant(() =>
-            ctx.api.editMessageText(opts.chatId, messageId, currentText(outcome.payment, outcome.email), NO_PREVIEW),
-          );
+          const { text, buttons } = paymentMessage(outcome.payment, { email: outcome.email, unarchived: outcome.unarchived });
+          await editTolerant(() => ctx.api.editMessageText(opts.chatId, messageId, text, editOptions(buttons)));
         }
         await ctx.reply(`Added ${name}.`);
       }
