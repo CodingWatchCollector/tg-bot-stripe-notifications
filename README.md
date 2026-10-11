@@ -67,6 +67,8 @@ Commands, in the configured chat only (updates from other chats are ignored):
   archived Student makes them active again and the reply adds the line `<name> was archived and is active again.` At most
   10 numbers may appear in the command, otherwise the bot answers with the usage line. Adjustments are never overwritten.
 - `/rename Old name -> New name` renames a Student. Earlier messages are not edited.
+- `/help` (and `/start`) replies with the command list and one line of usage for each. The list lives in
+  `src/app/commands.ts`; the same list is what the Telegram command menu shows (Deploy, step 7).
 
 If Telegram privacy mode is on for the bot and a bare command gets no answer, send `/students@<bot username>` instead.
 
@@ -108,10 +110,18 @@ Do the steps in this order. Each secret is set once, after the step that produce
      -H "content-type: application/json" \
      -d '{"url":"https://<your-worker>/telegram/webhook","secret_token":"<TELEGRAM_WEBHOOK_SECRET>","allowed_updates":["message","callback_query"]}'
    ```
-7. Only now point Stripe at the new code. In the Stripe dashboard (Developers > Webhooks) add an endpoint
+7. Register the command menu (the list Telegram shows when you type `/`). It is stored by Telegram, so do it once and again
+   whenever `src/app/commands.ts` changes. The script reads the production values from your shell, not from `.dev.vars`
+   (which holds the test bot); a value exported in the shell wins over `.dev.vars`:
+   ```
+   TELEGRAM_BOT_TOKEN=<TOKEN> TELEGRAM_CHAT_ID=<CHAT_ID> pnpm telegram:commands
+   ```
+   It registers the commands for the configured chat only and prints the registered list. `/help` works without this
+   step; only the menu depends on it.
+8. Only now point Stripe at the new code. In the Stripe dashboard (Developers > Webhooks) add an endpoint
    `https://<your-worker>/stripe/webhook` and select the events `checkout.session.completed` and
    `checkout.session.async_payment_succeeded`.
-8. Open the endpoint, reveal its signing secret (`whsec_...`) and store it with
+9. Open the endpoint, reveal its signing secret (`whsec_...`) and store it with
    `pnpm exec wrangler secret put STRIPE_WEBHOOK_SECRET`.
 
 ### Update an existing deployment
@@ -150,9 +160,11 @@ bot token locally: a bot has one webhook URL, and the production bot must keep i
 4. Start the Worker: `pnpm dev`.
 5. In a second terminal run `stripe listen --forward-to localhost:8787/stripe/webhook`. It prints a `whsec_...` signing
    secret; put it in `.dev.vars` as `STRIPE_WEBHOOK_SECRET` and restart `pnpm dev`.
-6. In a third terminal run `pnpm dev:telegram`. It polls the test bot for updates and forwards them to the local
+6. Optional: run `pnpm telegram:commands` once to give the test bot its command menu (it reads the test bot token and chat
+   id from `.dev.vars`).
+7. In a third terminal run `pnpm dev:telegram`. It polls the test bot for updates and forwards them to the local
    `/telegram/webhook` (set `DEV_WORKER_URL` in `.dev.vars` to forward elsewhere).
-7. Pay through a test-mode Payment Link with the card `4242 4242 4242 4242`, or run
+8. Pay through a test-mode Payment Link with the card `4242 4242 4242 4242`, or run
    `stripe trigger checkout.session.completed`.
 
 Notes: dashboard links always point at the live dashboard, so on test-mode payments they open the live dashboard and will
@@ -176,6 +188,9 @@ exported in your shell win over `.dev.vars`.
   `telegram update from other chat ignored:`) until `TELEGRAM_CHAT_ID` is updated.
 - A Pack is announced without lessons or a product name: compare the id in `src/domain/products.ts` with
   `pnpm exec wrangler d1 execute tg-bot --remote --command "SELECT payment_link_id, product_name, lessons FROM payments ORDER BY id DESC LIMIT 5"`.
+- `/help` answers but typing `/` shows no menu, or the menu is out of date: the menu is stored by Telegram and is only
+  changed by `pnpm telegram:commands`. Run it again after editing `src/app/commands.ts`. The menu is registered for the
+  configured chat only, so it does not appear in a private chat with the bot or in other groups.
 - Do not enable tracing in `wrangler.jsonc`: spans would record the Telegram URL, which contains the bot token.
 
 ## Development
@@ -184,5 +199,5 @@ exported in your shell win over `.dev.vars`.
 - `pnpm typecheck` runs `tsc`.
 - Layout: `src/domain` (provider-free types), `src/stripe` (verification and mapping), `src/db` (the only code with SQL),
   `src/app` (use cases and message format), `src/bot` (grammY bot), `src/notify` (Telegram transport),
-  `src/http` (webhook handlers), `src/worker.ts` (routing and wiring), `migrations` (D1 schema), `scripts` (local forwarder).
+  `src/http` (webhook handlers), `src/worker.ts` (routing and wiring), `migrations` (D1 schema), `scripts` (local forwarder and the command menu registration).
 - Planned extensions are in `docs/v2.md`.

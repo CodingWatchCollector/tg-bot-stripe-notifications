@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
 import { makeOnPaymentReceived } from "../src/app/onPaymentReceived";
 import { createBot } from "../src/bot/bot";
+import { helpText } from "../src/app/commands";
 import { createStore, type Store } from "../src/db/store";
 import { createWorker } from "../src/worker";
 import { createD1Fake, type D1Fake } from "./support/d1";
@@ -392,6 +393,19 @@ describe("/students", () => {
   test("empty", async () => {
     await post(message("/students"));
     expect(calls[0]?.payload.text).toBe("No students yet.");
+  });
+});
+
+describe("/help", () => {
+  test.each(["/help", "/start", "/help@tutor_bot"])("%s replies with the command list", async (text) => {
+    await post(message(text));
+    expect(methods()).toEqual(["sendMessage"]);
+    expect(calls[0]?.payload.text).toBe(helpText());
+  });
+
+  test("is ignored from another chat", async () => {
+    await post(message("/help", { chat: "-100999" }));
+    expect(calls).toEqual([]);
   });
 });
 

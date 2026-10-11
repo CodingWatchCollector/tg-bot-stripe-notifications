@@ -1,6 +1,7 @@
 import { Bot, GrammyError, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { emailTag, parseCallback, type Callback } from "../app/callbacks";
+import { helpText } from "../app/commands";
 import {
   adjustText,
   archivedText,
@@ -90,6 +91,10 @@ export function createBot(opts: BotOptions): Bot {
   const listReply = (text: string, rows: Button[][]) => ({
     text,
     options: { ...NO_PREVIEW, ...(rows.length > 0 && { reply_markup: inlineKeyboard(rows) }) },
+  });
+
+  bot.command(["help", "start"], async (ctx) => {
+    await ctx.reply(helpText());
   });
 
   bot.command("students", async (ctx) => {
