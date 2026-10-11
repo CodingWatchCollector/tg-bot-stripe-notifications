@@ -10,7 +10,6 @@ import {
   dismissedText,
   formatAmount,
   adjustText,
-  newStudentPrompt,
   paidPhrase,
   paymentButtons,
   paymentMessage,
@@ -32,6 +31,7 @@ import {
   parseUsername,
   type Student,
 } from "../src/domain/student";
+import { newStudentPrompt } from "../src/app/prompts";
 
 const base: PaymentFacts = {
   amountMinor: 16000,
