@@ -51,7 +51,15 @@ has no payment intent):
 
 Commands, in the configured chat only (updates from other chats are ignored):
 
-- `/students` lists the active Students with their Balance: `Olena: 5`.
+- `/students` lists the active Students with their Balance: `Olena: 5`, with one button per Student (the first 90 by name).
+  `/archived` lists the Archived Students the same way.
+- A button opens the Student card as a new message: Balance, emails and `@username`, with buttons that edit it in place.
+  `-1` and `+1` record an Adjustment at once with reason `-`, no prompt; like `/adjust`, they make an Archived Student
+  active again and the card says so, while `-1` and `+1` on a payment message never do. `Rename`, `Username` and `Email`
+  ask for the new value as a reply to the bot's prompt and answer with a fresh card; a username is 4-32 letters, digits or
+  underscores, starting with a letter, and the reply `-` (shown as `- to clear`) removes it. `➖ Email` lists the emails,
+  one tap removes one. An email that belongs to another Student is refused, never moved. `Archive` and `Unarchive` act on
+  one tap. Editing an Archived Student leaves them archived. Larger or reasoned changes stay on `/adjust`.
 - `/adjust <name> <count> [reason]` adds an Adjustment to a Student's Balance. The count is 1-99, `+` or no sign adds and
   `-` subtracts; the reason is optional (stored as `-` when omitted), otherwise 1-200 characters, and is stored with the Adjustment. The name may contain spaces and numbers
   (the longest name that matches a Student wins). Examples: `/adjust Olena +5 opening balance` replies

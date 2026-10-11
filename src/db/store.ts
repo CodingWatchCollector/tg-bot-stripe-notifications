@@ -49,11 +49,39 @@ export type AdjustStudentOutcome =
   | { kind: "adjusted"; student: Student; before: number; after: number; unarchived: boolean }
   | { kind: "not_found" };
 
+export interface StudentCard extends Student {
+  balance: number;
+  emails: string[];
+}
+
+export type RenameOutcome =
+  | { kind: "renamed"; card: StudentCard; previousName: string }
+  | { kind: "name_taken"; existing: Student }
+  | { kind: "not_found" };
+
+export type ArchiveOutcome =
+  | { kind: "updated"; card: StudentCard }
+  | { kind: "already_resolved"; card: StudentCard }
+  | { kind: "not_found" };
+
+export type AddEmailOutcome =
+  | { kind: "added"; card: StudentCard }
+  | { kind: "already_resolved"; card: StudentCard }
+  | { kind: "email_taken"; owner: Student }
+  | { kind: "not_found" };
+
+export type RemoveEmailOutcome =
+  | { kind: "removed"; card: StudentCard }
+  | { kind: "already_resolved"; card: StudentCard }
+  | { kind: "not_found" };
+
+export type UsernameOutcome = { kind: "updated"; card: StudentCard } | { kind: "not_found" };
+
 export interface Store {
   findStudentByEmail(email: string): Promise<Student | null>;
   listActiveStudents(): Promise<Student[]>;
   findStudentByNameKey(key: string): Promise<Student | null>;
-  renameStudent(id: number, name: string): Promise<"ok" | "name_taken" | "not_found">;
+  renameStudent(studentId: number, name: string): Promise<RenameOutcome>;
   recordPayment(p: PaymentReceived, matched: Student | null, product?: Product | null): Promise<RecordedPayment>;
   markNotified(paymentId: number, messageId: number): Promise<void>;
   getPayment(id: number): Promise<PaymentView | null>;
@@ -62,7 +90,12 @@ export interface Store {
   dismissPayment(paymentId: number): Promise<DismissOutcome>;
   adjustPayment(paymentId: number, delta: 1 | -1): Promise<AdjustPaymentOutcome>;
   adjustStudent(studentId: number, delta: number, reason: string): Promise<AdjustStudentOutcome>;
-  listStudentBalances(): Promise<StudentSummary[]>;
+  listStudentBalances(archived?: boolean): Promise<StudentSummary[]>;
+  getStudentCard(studentId: number): Promise<StudentCard | null>;
+  setArchived(studentId: number, archived: boolean): Promise<ArchiveOutcome>;
+  addEmail(studentId: number, email: string): Promise<AddEmailOutcome>;
+  removeEmail(studentId: number, email: string): Promise<RemoveEmailOutcome>;
+  setUsername(studentId: number, username: string | null): Promise<UsernameOutcome>;
 }
 
 type Row = Record<string, unknown>;
@@ -145,6 +178,19 @@ export function createStore(db: D1Database): Store {
     return r === null ? null : toStudent(r);
   }
 
+  async function cardById(id: number): Promise<StudentCard | null> {
+    const r = await one(`SELECT s.*, ${balanceSql("s.id")} AS balance FROM students s WHERE s.id = ?1`, id);
+    if (r === null) return null;
+    const { results } = await db.prepare("SELECT email FROM payer_emails WHERE student_id = ?1 ORDER BY email").bind(id).all<Row>();
+    return { ...toStudent(r), balance: r.balance as number, emails: results.map((e) => e.email as string) };
+  }
+
+  async function committedCard(id: number): Promise<StudentCard> {
+    const card = await cardById(id);
+    if (card === null) throw new Error("student missing after write");
+    return card;
+  }
+
   const emailOutcome = (payment: PaymentView, owner: Student | null, studentId: number | null) => {
     if (payment.customerEmail === null) return "none" as const;
     if (owner === null) return "saved" as const;
@@ -175,14 +221,68 @@ export function createStore(db: D1Database): Store {
 
     findStudentByNameKey: studentByKey,
 
-    async renameStudent(id, name) {
+    async renameStudent(studentId, name) {
       const clean = normalizeName(name);
       const key = nameKey(clean);
-      await db.prepare("UPDATE OR IGNORE students SET name = ?1, name_key = ?2 WHERE id = ?3").bind(clean, key, id).run();
-      const student = await studentById(id);
-      if (student === null) return "not_found";
-      return student.nameKey === key ? "ok" : "name_taken";
+      const before = await studentById(studentId);
+      if (before === null) return { kind: "not_found" };
+
+      const [update] = await db.batch([
+        db.prepare("UPDATE OR IGNORE students SET name = ?1, name_key = ?2 WHERE id = ?3 RETURNING id").bind(clean, key, studentId),
+      ]);
+      if (update?.results.length === 1) return { kind: "renamed", card: await committedCard(studentId), previousName: before.name };
+      if ((await studentById(studentId)) === null) return { kind: "not_found" };
+      const holder = await studentByKey(key);
+      if (holder !== null && holder.id !== studentId) return { kind: "name_taken", existing: holder };
+      throw new Error("rename ignored without a name holder");
     },
+
+    async setArchived(studentId, archived) {
+      const [update] = await db.batch([
+        db.prepare("UPDATE students SET archived = ?1 WHERE id = ?2 AND archived <> ?1 RETURNING id").bind(archived ? 1 : 0, studentId),
+      ]);
+      const card = await cardById(studentId);
+      if (card === null) return { kind: "not_found" };
+      return update?.results.length === 1 ? { kind: "updated", card } : { kind: "already_resolved", card };
+    },
+
+    async addEmail(studentId, email) {
+      const [insert] = await db.batch([
+        db
+          .prepare(
+            `INSERT INTO payer_emails(email, student_id)
+             SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM students WHERE id = ?2)
+             ON CONFLICT(email) DO NOTHING RETURNING student_id`,
+          )
+          .bind(email, studentId),
+      ]);
+      if (insert?.results.length === 1) return { kind: "added", card: await committedCard(studentId) };
+      const card = await cardById(studentId);
+      if (card === null) return { kind: "not_found" };
+      const owner = await emailOwner(email);
+      if (owner === null) throw new Error("email insert ignored without an owner");
+      return owner.id === studentId ? { kind: "already_resolved", card } : { kind: "email_taken", owner };
+    },
+
+    async removeEmail(studentId, email) {
+      const [del] = await db.batch([
+        db.prepare("DELETE FROM payer_emails WHERE email = ?1 AND student_id = ?2 RETURNING email").bind(email, studentId),
+      ]);
+      const card = await cardById(studentId);
+      if (card === null) return { kind: "not_found" };
+      return del?.results.length === 1 ? { kind: "removed", card } : { kind: "already_resolved", card };
+    },
+
+    async setUsername(studentId, username) {
+      const { results } = await db
+        .prepare("UPDATE students SET telegram_username = ?1 WHERE id = ?2 RETURNING id")
+        .bind(username, studentId)
+        .all<Row>();
+      if (results.length !== 1) return { kind: "not_found" };
+      return { kind: "updated", card: await committedCard(studentId) };
+    },
+
+    getStudentCard: cardById,
 
     async recordPayment(p, matched, product = null) {
       const [, unarchive] = await db.batch([
@@ -349,9 +449,10 @@ export function createStore(db: D1Database): Store {
       return { kind: "adjusted", student: toStudent(r), before: after - delta, after, unarchived: unarchive?.results.length === 1 };
     },
 
-    async listStudentBalances() {
+    async listStudentBalances(archived = false) {
       const { results } = await db
-        .prepare(`SELECT s.id, s.name, ${balanceSql("s.id")} AS balance FROM students s WHERE s.archived = 0`)
+        .prepare(`SELECT s.id, s.name, ${balanceSql("s.id")} AS balance FROM students s WHERE s.archived = ?1`)
+        .bind(archived ? 1 : 0)
         .all<Row>();
       return results.map((r) => ({ id: r.id as number, name: r.name as string, balance: r.balance as number }));
     },

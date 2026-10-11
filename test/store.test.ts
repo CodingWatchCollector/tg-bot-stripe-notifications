@@ -665,6 +665,15 @@ describe("lost races", () => {
     });
   });
 
+  test("renameStudent loses the name to a concurrent insert [C4]", async () => {
+    const olena = addStudent(fake, "Olena");
+    const ran = hook("INSERT INTO students(name, name_key, created_at) VALUES ('Olena K', 'olena k', 't')");
+    const out = await store.renameStudent(olena, "Olena K");
+    expect(out).toMatchObject({ kind: "name_taken", existing: { name: "Olena K" } });
+    expect(rows("SELECT name FROM students ORDER BY id")).toEqual([{ name: "Olena" }, { name: "Olena K" }]);
+    expect(ran()).toBe(1);
+  });
+
   describe("adjustStudent", () => {
     test("reports no unarchive when the Student became active after the lookup [M8]", async () => {
       const oldOne = addStudent(fake, "Old One", { archived: true });
@@ -693,25 +702,177 @@ describe("lost races", () => {
 describe("renameStudent", () => {
   test("renames", async () => {
     const id = addStudent(fake, "Olena");
-    expect(await store.renameStudent(id, "Olena K")).toBe("ok");
+    expect(await store.renameStudent(id, "Olena K")).toMatchObject({
+      kind: "renamed",
+      previousName: "Olena",
+      card: { name: "Olena K", nameKey: "olena k" },
+    });
     expect(rows("SELECT name, name_key FROM students")).toEqual([{ name: "Olena K", name_key: "olena k" }]);
   });
 
   test("changing only the case succeeds", async () => {
     const id = addStudent(fake, "Olena");
-    expect(await store.renameStudent(id, "OLENA")).toBe("ok");
+    expect(await store.renameStudent(id, "OLENA")).toMatchObject({ kind: "renamed", previousName: "Olena", card: { name: "OLENA" } });
     expect(rows("SELECT name FROM students")).toEqual([{ name: "OLENA" }]);
   });
 
-  test("a name used by another student is refused", async () => {
+  test("a taken name is name_taken and both rows stay [C4]", async () => {
     const id = addStudent(fake, "Olena");
     addStudent(fake, "Ira");
-    expect(await store.renameStudent(id, "ira")).toBe("name_taken");
+    expect(await store.renameStudent(id, "ira")).toMatchObject({ kind: "name_taken", existing: { name: "Ira" } });
     expect(rows("SELECT name FROM students ORDER BY id")).toEqual([{ name: "Olena" }, { name: "Ira" }]);
   });
 
   test("unknown id", async () => {
-    expect(await store.renameStudent(99, "X")).toBe("not_found");
+    expect(await store.renameStudent(99, "X")).toEqual({ kind: "not_found" });
     expect(count("students")).toBe(0);
+  });
+
+  test("the outcome carries the full card", async () => {
+    const olena = addStudent(fake, "Olena", { emails: ["olena@example.com"] });
+    addAdjustment(fake, olena, 5);
+    fake.raw.run("UPDATE students SET telegram_username = 'olena_k' WHERE id = ?1", olena);
+    expect(await store.renameStudent(olena, "Olena K")).toEqual({
+      kind: "renamed",
+      previousName: "Olena",
+      card: {
+        id: olena,
+        name: "Olena K",
+        nameKey: "olena k",
+        telegramUsername: "olena_k",
+        archived: false,
+        createdAt: "2026-10-01T00:00:00.000Z",
+        balance: 5,
+        emails: ["olena@example.com"],
+      },
+    });
+  });
+});
+
+describe("student card writes", () => {
+  const cardOf = (id: number, over: Record<string, unknown> = {}) => ({
+    id,
+    name: "Olena",
+    nameKey: "olena",
+    telegramUsername: null,
+    archived: false,
+    createdAt: "2026-10-01T00:00:00.000Z",
+    balance: 0,
+    emails: [] as string[],
+    ...over,
+  });
+  const emailRows = () => rows("SELECT email, student_id FROM payer_emails ORDER BY email");
+
+  describe("getStudentCard and listStudentBalances", () => {
+    test("a card has the Balance and the emails in ascending order", async () => {
+      const olena = addStudent(fake, "Olena", { emails: ["olena@example.com", "o2@example.com"] });
+      addAdjustment(fake, olena, 5);
+      expect(await store.getStudentCard(olena)).toEqual(cardOf(olena, { balance: 5, emails: ["o2@example.com", "olena@example.com"] }));
+      expect(await store.getStudentCard(99)).toBeNull();
+    });
+
+    test("an archived list holds only Archived Students", async () => {
+      addStudent(fake, "Olena");
+      const old = addStudent(fake, "Old One", { archived: true });
+      addAdjustment(fake, old, 2);
+      expect(await store.listStudentBalances(true)).toEqual([{ id: old, name: "Old One", balance: 2 }]);
+      expect((await store.listStudentBalances()).map((s) => s.name)).toEqual(["Olena"]);
+    });
+  });
+
+  describe("setArchived", () => {
+    test("archives and unarchives, reporting the card", async () => {
+      const olena = addStudent(fake, "Olena");
+      expect(await store.setArchived(olena, true)).toEqual({ kind: "updated", card: cardOf(olena, { archived: true }) });
+      expect(await store.setArchived(olena, false)).toEqual({ kind: "updated", card: cardOf(olena) });
+      expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+    });
+
+    test("a second archive is already_resolved [C1]", async () => {
+      const olena = addStudent(fake, "Olena");
+      await store.setArchived(olena, true);
+      expect(await store.setArchived(olena, true)).toEqual({ kind: "already_resolved", card: cardOf(olena, { archived: true }) });
+    });
+
+    test("an unknown id is not_found", async () => {
+      expect(await store.setArchived(99, true)).toEqual({ kind: "not_found" });
+    });
+  });
+
+  describe("addEmail", () => {
+    let olena: number;
+    let ira: number;
+    beforeEach(() => {
+      olena = addStudent(fake, "Olena", { emails: ["olena@example.com"] });
+      ira = addStudent(fake, "Ira", { emails: ["ira@example.com"] });
+    });
+
+    test("adds an email", async () => {
+      expect(await store.addEmail(olena, "o3@example.com")).toEqual({
+        kind: "added",
+        card: cardOf(olena, { emails: ["o3@example.com", "olena@example.com"] }),
+      });
+      expect(emailRows()).toContainEqual({ email: "o3@example.com", student_id: olena });
+    });
+
+    test("an email already theirs is already_resolved", async () => {
+      expect(await store.addEmail(olena, "olena@example.com")).toEqual({
+        kind: "already_resolved",
+        card: cardOf(olena, { emails: ["olena@example.com"] }),
+      });
+      expect(emailRows()).toHaveLength(2);
+    });
+
+    test("an email owned by Ira is email_taken and not moved [C3]", async () => {
+      expect(await store.addEmail(olena, "ira@example.com")).toEqual({
+        kind: "email_taken",
+        owner: { id: ira, name: "Ira", nameKey: "ira", telegramUsername: null, archived: false, createdAt: "2026-10-01T00:00:00.000Z" },
+      });
+      expect(emailRows()).toContainEqual({ email: "ira@example.com", student_id: ira });
+    });
+
+    test("an unknown id is not_found and writes nothing [C5]", async () => {
+      expect(await store.addEmail(99, "z@example.com")).toEqual({ kind: "not_found" });
+      expect(emailRows().map((r) => r.email)).not.toContain("z@example.com");
+    });
+  });
+
+  describe("removeEmail", () => {
+    let olena: number;
+    beforeEach(() => {
+      olena = addStudent(fake, "Olena", { emails: ["olena@example.com"] });
+    });
+
+    test("removes the Student's own email", async () => {
+      expect(await store.removeEmail(olena, "olena@example.com")).toEqual({ kind: "removed", card: cardOf(olena) });
+      expect(emailRows()).toEqual([]);
+    });
+
+    test("another Student's email is already_resolved and kept [C2]", async () => {
+      const ira = addStudent(fake, "Ira", { emails: ["ira@example.com"] });
+      expect(await store.removeEmail(olena, "ira@example.com")).toEqual({
+        kind: "already_resolved",
+        card: cardOf(olena, { emails: ["olena@example.com"] }),
+      });
+      expect(emailRows()).toContainEqual({ email: "ira@example.com", student_id: ira });
+    });
+
+    test("an unknown id is not_found", async () => {
+      expect(await store.removeEmail(99, "x@y.z")).toEqual({ kind: "not_found" });
+    });
+  });
+
+  describe("setUsername", () => {
+    test("sets and clears, keeping case", async () => {
+      const olena = addStudent(fake, "Olena");
+      expect(await store.setUsername(olena, "Olena_K2")).toEqual({ kind: "updated", card: cardOf(olena, { telegramUsername: "Olena_K2" }) });
+      expect(rows("SELECT telegram_username FROM students")).toEqual([{ telegram_username: "Olena_K2" }]);
+      expect(await store.setUsername(olena, null)).toEqual({ kind: "updated", card: cardOf(olena) });
+      expect(rows("SELECT telegram_username FROM students")).toEqual([{ telegram_username: null }]);
+    });
+
+    test("an unknown id is not_found", async () => {
+      expect(await store.setUsername(99, "abcd")).toEqual({ kind: "not_found" });
+    });
   });
 });

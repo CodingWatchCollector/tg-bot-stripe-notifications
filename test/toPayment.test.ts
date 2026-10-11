@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { toPaymentReceived } from "../src/stripe/toPayment";
+import { normalizeEmail } from "../src/domain/student";
 import { expectedPayment, paidEvent, sessionEvent } from "./fixtures";
 
 const completed = (session: Record<string, unknown>) =>
@@ -98,5 +99,16 @@ describe("toPaymentReceived", () => {
     ["checkout.session.async_payment_succeeded", "no_payment_required"],
   ])("%s with %s -> null", (type, payment_status) => {
     expect(toPaymentReceived(sessionEvent(type, { payment_status }))).toBeNull();
+  });
+});
+
+describe("email normalization", () => {
+  test.each([
+    [" A@B.C ", "a@b.c"],
+    ["\tX@Y.Z\n", "x@y.z"],
+    ["Ö@X.DE", "ö@x.de"],
+  ])("%j is %j in the Stripe mapping and in normalizeEmail", (input, expected) => {
+    expect(completed({ customer_details: { name: "Anna K", email: input } })?.customerEmail).toBe(expected);
+    expect(normalizeEmail(input)).toBe(expected);
   });
 });

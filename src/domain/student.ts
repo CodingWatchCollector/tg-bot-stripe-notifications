@@ -24,3 +24,19 @@ const hasLength = (s: string, max: number): boolean => {
 export const isValidName = (s: string): boolean => hasLength(s, 64);
 
 export const isValidReason = (s: string): boolean => hasLength(s, 200);
+
+export const normalizeEmail = (s: string): string => s.trim().toLowerCase();
+
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Takes a normalized address. Loose on purpose: a typo is an Owner mistake, not a security boundary.
+export const isValidEmail = (s: string): boolean => [...s].length <= 254 && EMAIL.test(s);
+
+const USERNAME = /^[A-Za-z][A-Za-z0-9_]{3,31}$/;
+
+export function parseUsername(s: string): { username: string | null } | null {
+  const text = s.trim();
+  if (text === "-") return { username: null };
+  const username = text.startsWith("@") ? text.slice(1) : text;
+  return USERNAME.test(username) ? { username } : null;
+}

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
 import {
+  archivedText,
   assignedText,
+  cardMessage,
+  emailRemovalButtons,
+  studentListButtons,
   customerLine,
   dashboardLink,
   dismissedText,
@@ -16,7 +20,18 @@ import {
   type PaymentFacts,
 } from "../src/app/messages";
 import type { PaymentView } from "../src/db/store";
-import { compareNames, isValidName, isValidReason, nameKey, normalizeName, type Student } from "../src/domain/student";
+import type { StudentCard } from "../src/db/store";
+import {
+  compareNames,
+  isValidEmail,
+  isValidName,
+  isValidReason,
+  nameKey,
+  normalizeEmail,
+  normalizeName,
+  parseUsername,
+  type Student,
+} from "../src/domain/student";
 
 const base: PaymentFacts = {
   amountMinor: 16000,
@@ -378,5 +393,136 @@ describe("isValidReason", () => {
     [`a  ${"b".repeat(197)}`, true],
   ])("%j -> %s", (reason, ok) => {
     expect(isValidReason(reason)).toBe(ok);
+  });
+});
+
+describe("student list keyboard", () => {
+  test("two buttons per row in name order", () => {
+    const rows = studentListButtons([
+      { id: 3, name: "Olena", balance: 5 },
+      { id: 2, name: "ira + pasha 2", balance: -1 },
+      { id: 1, name: "Ira + Pasha", balance: 0 },
+    ]);
+    expect(rows).toEqual([
+      [
+        { text: "Ira + Pasha", data: "s:1:open" },
+        { text: "ira + pasha 2", data: "s:2:open" },
+      ],
+      [{ text: "Olena", data: "s:3:open" }],
+    ]);
+  });
+
+  test("at most 90 buttons, the first 90 by name", () => {
+    const summaries = Array.from({ length: 91 }, (_, i) => ({ id: i + 1, name: `S${String(i).padStart(2, "0")}`, balance: 0 }));
+    const rows = studentListButtons([...summaries].reverse());
+    expect(rows).toHaveLength(45);
+    expect(rows.flat()).toHaveLength(90);
+    expect(rows.flat().map((b) => b.text)).toEqual(summaries.slice(0, 90).map((s) => s.name));
+  });
+});
+
+describe("archivedText", () => {
+  test("lists in compareNames order", () => {
+    expect(
+      archivedText([
+        { id: 2, name: "bob", balance: 1 },
+        { id: 1, name: "Bob", balance: 0 },
+        { id: 3, name: "Ada", balance: -1 },
+      ]),
+    ).toBe("Archived students (3):\nAda: -1\nBob: 0\nbob: 1");
+  });
+
+  test("empty", () => {
+    expect(archivedText([])).toBe("No archived students.");
+  });
+});
+
+describe("cardMessage", () => {
+  const card: StudentCard = {
+    id: 4,
+    name: "Olena",
+    nameKey: "olena",
+    telegramUsername: "olena_k",
+    archived: false,
+    createdAt: "t",
+    balance: 5,
+    emails: ["o2@example.com", "olena@example.com"],
+  };
+
+  test("an active card", () => {
+    expect(cardMessage(card)).toEqual({
+      text: "👤 Olena\nBalance: 5\nEmails: o2@example.com, olena@example.com\nTelegram: @olena_k",
+      buttons: [
+        [
+          { text: "-1", data: "s:4:-1" },
+          { text: "+1", data: "s:4:+1" },
+        ],
+        [
+          { text: "✏️ Rename", data: "s:4:name" },
+          { text: "👤 Username", data: "s:4:user" },
+        ],
+        [
+          { text: "➕ Email", data: "s:4:email+" },
+          { text: "➖ Email", data: "s:4:email-" },
+        ],
+        [{ text: "🗄 Archive", data: "s:4:archive" }],
+      ],
+    });
+  });
+
+  test("an archived card without emails or username", () => {
+    const out = cardMessage({ ...card, archived: true, emails: [], telegramUsername: null, balance: 0, name: "Old One" });
+    expect(out.text).toBe("👤 Old One (archived)\nBalance: 0\nEmails: none\nTelegram: not set");
+    expect(out.buttons.map((row) => row.map((b) => b.text))).toEqual([["-1", "+1"], ["✏️ Rename", "👤 Username"], ["➕ Email"], ["📤 Unarchive"]]);
+    expect(out.buttons[3]).toEqual([{ text: "📤 Unarchive", data: "s:4:unarchive" }]);
+  });
+
+  test("a note is the first line", () => {
+    expect(cardMessage(card, "✅ Saved.").text.split("\n").slice(0, 2)).toEqual(["✅ Saved.", "👤 Olena"]);
+  });
+});
+
+describe("emailRemovalButtons", () => {
+  test("one row per email, then Back", () => {
+    const card = { id: 4, emails: ["o2@example.com", "olena@example.com"] } as StudentCard;
+    expect(emailRemovalButtons(card)).toEqual([
+      [{ text: "✖️ o2@example.com", data: "s:4:rm:e5bb3129" }],
+      [{ text: "✖️ olena@example.com", data: "s:4:rm:7007e771" }],
+      [{ text: "⬅️ Back", data: "s:4:card" }],
+    ]);
+  });
+});
+
+describe("email and username rules", () => {
+  test.each([
+    [" A@B.C ", "a@b.c"],
+    ["\tX@Y.Z\n", "x@y.z"],
+  ])("normalizeEmail(%j)", (input, expected) => {
+    expect(normalizeEmail(input)).toBe(expected);
+  });
+
+  test.each([
+    ["a@b.c", true],
+    ["a".repeat(249) + "@b.cd", true],
+    ["a@b", false],
+    ["not-an-email", false],
+    ["a b@c.d", false],
+    ["a".repeat(250) + "@b.cd", false],
+  ])("isValidEmail(%j) is %s", (input, expected) => {
+    expect(isValidEmail(input)).toBe(expected);
+  });
+
+  test.each([
+    [" - ", { username: null }],
+    ["@Olena_K2", { username: "Olena_K2" }],
+    ["abcd", { username: "abcd" }],
+    ["a" + "b".repeat(31), { username: "a" + "b".repeat(31) }],
+    ["abc", null],
+    ["1abcd", null],
+    ["a".repeat(33), null],
+    ["@@x", null],
+    ["has space", null],
+  ])("parseUsername(%j)", (input, expected) => {
+    expect(parseUsername(input)).toEqual(expected);
   });
 });

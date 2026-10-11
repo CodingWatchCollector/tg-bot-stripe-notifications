@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
+import { makeOnPaymentReceived } from "../src/app/onPaymentReceived";
 import { createBot } from "../src/bot/bot";
 import { createStore, type Store } from "../src/db/store";
 import { createWorker } from "../src/worker";
@@ -860,6 +861,502 @@ describe("/students with Balances", () => {
   });
 });
 
+const CARD_TEXT = (name: string, balance: number, emails: string, telegram: string, archived = false) =>
+  `👤 ${name}${archived ? " (archived)" : ""}\nBalance: ${balance}\nEmails: ${emails}\nTelegram: ${telegram}`;
+const OLENA_EMAILS = "o2@example.com, olena@example.com";
+const buttonRow = (...b: [string, string][]) => b.map(([text, callback_data]) => ({ text, callback_data }));
+const cardKeyboard = (sid: number, archived: boolean, minus: boolean) => ({
+  inline_keyboard: [
+    buttonRow(["-1", `s:${sid}:-1`], ["+1", `s:${sid}:+1`]),
+    buttonRow(["✏️ Rename", `s:${sid}:name`], ["👤 Username", `s:${sid}:user`]),
+    buttonRow(["➕ Email", `s:${sid}:email+`], ...(minus ? ([["➖ Email", `s:${sid}:email-`]] as [string, string][]) : [])),
+    buttonRow(archived ? ["📤 Unarchive", `s:${sid}:unarchive`] : ["🗄 Archive", `s:${sid}:archive`]),
+  ],
+});
+const ACTIVE = (sid: number, minus: boolean) => cardKeyboard(sid, false, minus);
+const ARCHIVED = (sid: number, minus: boolean) => cardKeyboard(sid, true, minus);
+const CARD = { messageId: 60 };
+
+function seedCards() {
+  const olena = addStudent(fake, "Olena", { emails: ["olena@example.com", "o2@example.com"] });
+  fake.raw.run("UPDATE students SET telegram_username = 'olena_k' WHERE id = ?1", olena);
+  addAdjustment(fake, olena, 5);
+  const ira = addStudent(fake, "Ira + Pasha", { emails: ["ira@example.com"] });
+  const ira2 = addStudent(fake, "ira + pasha 2");
+  addAdjustment(fake, ira2, -1);
+  const old = addStudent(fake, "Old One", { archived: true });
+  return { olena, ira, ira2, old };
+}
+const olenaCard = (balance = 5, telegram = "@olena_k", name = "Olena", emails = OLENA_EMAILS) => CARD_TEXT(name, balance, emails, telegram);
+const noCalls = () => expect(calls).toHaveLength(0);
+const onlyNotFound = () => {
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+};
+const sent = () => calls.filter((c) => c.method === "sendMessage");
+const lastSent = () => sent().at(-1)?.payload;
+const NOPREVIEW = { link_preview_options: { is_disabled: true } };
+
+describe("student lists", () => {
+  test("/students has one button per Student", async () => {
+    const { olena, ira, ira2 } = seedCards();
+    await post(message("/students"));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.payload).toMatchObject({
+      text: "Students (3):\nIra + Pasha: 0\nira + pasha 2: -1\nOlena: 5",
+      reply_markup: {
+        inline_keyboard: [
+          buttonRow(["Ira + Pasha", `s:${ira}:open`], ["ira + pasha 2", `s:${ira2}:open`]),
+          buttonRow(["Olena", `s:${olena}:open`]),
+        ],
+      },
+      ...NOPREVIEW,
+    });
+  });
+
+  test("no Students -> no keyboard", async () => {
+    await post(message("/students"));
+    expect(calls[0]?.payload.text).toBe("No students yet.");
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+  });
+
+  test.each(["/archived", "/archived@tutor_bot"])("%s lists Archived Students with buttons", async (text) => {
+    const { old } = seedCards();
+    await post(message(text));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.payload).toMatchObject({
+      text: "Archived students (1):\nOld One: 0",
+      reply_markup: { inline_keyboard: [buttonRow(["Old One", `s:${old}:open`])] },
+      ...NOPREVIEW,
+    });
+  });
+
+  test("/archived with none", async () => {
+    addStudent(fake, "Olena");
+    await post(message("/archived"));
+    expect(calls[0]?.payload.text).toBe("No archived students.");
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+  });
+});
+
+describe("opening the card", () => {
+  test("an active card is sent as a new message", async () => {
+    const { olena } = seedCards();
+    const before = dump();
+    await post(tap(`s:${olena}:open`, CARD));
+    expect(methods()).toEqual(["answerCallbackQuery", "sendMessage"]);
+    expect(calls[0]?.payload.text).toBeUndefined();
+    expect(calls[1]?.payload).toMatchObject({ chat_id: CHAT, text: olenaCard(), reply_markup: ACTIVE(olena, true), ...NOPREVIEW });
+    expect(calls[1]?.payload.entities).toBeUndefined();
+    expect(dump()).toEqual(before);
+  });
+
+  test("an archived card shows its state", async () => {
+    const { old } = seedCards();
+    await post(tap(`s:${old}:open`, CARD));
+    expect(calls[1]?.payload).toMatchObject({
+      text: "👤 Old One (archived)\nBalance: 0\nEmails: none\nTelegram: not set",
+      reply_markup: ARCHIVED(old, false),
+    });
+  });
+
+  test("an unknown Student is Not found", async () => {
+    seedCards();
+    await post(tap("s:999:open", CARD));
+    onlyNotFound();
+  });
+
+  test("unparsable card data is Not found and writes nothing", async () => {
+    seedCards();
+    const before = dump();
+    await post(tap("s:1:bogus", CARD));
+    onlyNotFound();
+    expect(dump()).toEqual(before);
+  });
+});
+
+describe("card -1 / +1", () => {
+  test("edits in place and records reason '-'", async () => {
+    const { olena } = seedCards();
+    let rowsWhenAnswered: unknown;
+    respond = (method) => {
+      if (method === "answerCallbackQuery") rowsWhenAnswered = fake.raw.all("SELECT student_id, delta, reason, payment_id, created_at FROM adjustments WHERE reason = '-'");
+      return { ok: true, result: true };
+    };
+    await post(tap(`s:${olena}:-1`, { messageId: 60, text: "👤 Olena\nBalance: 100" }));
+    expect(rowsWhenAnswered).toEqual([{ student_id: olena, delta: -1, reason: "-", payment_id: null, created_at: expect.stringMatching(ISO) }]);
+    expect(methods()).toEqual(["answerCallbackQuery", "editMessageText"]);
+    expect(calls[0]?.payload.text).toBeUndefined();
+    expect(edited()?.payload).toMatchObject({ message_id: 60, text: olenaCard(4), reply_markup: ACTIVE(olena, true), ...NOPREVIEW });
+
+    calls.length = 0;
+    await post(tap(`s:${olena}:+1`, CARD));
+    expect(edited()?.payload.text).toBe(olenaCard(5));
+    expect(fake.raw.all("SELECT reason FROM adjustments WHERE student_id = ?1 AND reason = '-'".replace("?1", String(olena)))).toHaveLength(2);
+  });
+
+  test("on an Archived Student it unarchives, like /adjust", async () => {
+    const { old } = seedCards();
+    await post(tap(`s:${old}:+1`, CARD));
+    expect(fake.raw.all(`SELECT student_id, delta, reason, payment_id FROM adjustments WHERE student_id = ${old}`)).toEqual([
+      { student_id: old, delta: 1, reason: "-", payment_id: null },
+    ]);
+    expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${old}`)).toEqual([{ archived: 0 }]);
+    expect(edited()?.payload).toMatchObject({
+      text: `Old One was archived and is active again.\n${CARD_TEXT("Old One", 1, "none", "not set")}`,
+      reply_markup: ACTIVE(old, false),
+      ...NOPREVIEW,
+    });
+
+    calls.length = 0;
+    await post(message("/students"));
+    expect(String(calls[0]?.payload.text)).toContain("Old One: 1");
+
+    calls.length = 0;
+    await post(tap(`s:${old}:-1`, CARD));
+    expect(edited()?.payload.text).toBe(CARD_TEXT("Old One", 0, "none", "not set"));
+  });
+
+  test("an unknown Student is Not found and writes nothing", async () => {
+    seedCards();
+    const before = fake.raw.all("SELECT * FROM adjustments");
+    await post(tap("s:999:+1", CARD));
+    onlyNotFound();
+    expect(fake.raw.all("SELECT * FROM adjustments")).toEqual(before);
+  });
+});
+
+describe("unknown Student on every card action", () => {
+  test.each(["name", "user", "email+", "card", "email-", "rm:7007e771", "unarchive", "archive", "-1"])("s:999:%s", async (action) => {
+    seedCards();
+    const before = dump();
+    await post(tap(`s:999:${action}`, CARD));
+    onlyNotFound();
+    expect(dump()).toEqual(before);
+  });
+});
+
+describe("rename on the card", () => {
+  test("the prompt, then the reply sends a fresh card", async () => {
+    const { olena } = seedCards();
+    await post(tap(`s:${olena}:name`, CARD));
+    expect(methods()).toEqual(["answerCallbackQuery", "sendMessage"]);
+    expect(calls[0]?.payload.text).toBeUndefined();
+    expect(calls[1]?.payload).toMatchObject({
+      text: `New name for student #${olena} (Olena):`,
+      reply_markup: { force_reply: true },
+    });
+
+    calls.length = 0;
+    await post(message("  Olena   K ", { reply: { text: `New name for student #${olena} (Olena):`, fromId: 999 } }));
+    expect(fake.raw.all(`SELECT name, name_key FROM students WHERE id = ${olena}`)).toEqual([{ name: "Olena K", name_key: "olena k" }]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.payload).toMatchObject({
+      text: `✅ Renamed Olena to Olena K.\n${olenaCard(5, "@olena_k", "Olena K")}`,
+      reply_markup: ACTIVE(olena, true),
+      ...NOPREVIEW,
+    });
+  });
+
+  test.each([
+    ["too long", (_n: number) => "x".repeat(65), "Name must be 1-64 characters."],
+    ["taken, ignoring case", (_n: number) => "IRA + PASHA", "A student named Ira + Pasha already exists."],
+  ])("%s", async (_t, name, expected) => {
+    const { olena } = seedCards();
+    await post(message(name(olena), { reply: { text: `New name for student #${olena} (Olena):`, fromId: 999 } }));
+    expect(calls.map((c) => c.payload.text)).toEqual([expected]);
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+    expect(fake.raw.all(`SELECT name FROM students WHERE id = ${olena}`)).toEqual([{ name: "Olena" }]);
+  });
+
+  test("an unknown Student", async () => {
+    seedCards();
+    await post(message("Ghost", { reply: { text: "New name for student #999 (Ghost):", fromId: 999 } }));
+    expect(calls.map((c) => c.payload.text)).toEqual(["Student #999 not found."]);
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+  });
+});
+
+describe("add email on the card", () => {
+  const askText = (sid: number, name = "Olena") => `Email to add for student #${sid} (${name}):`;
+  const reply = (text: string, sid: number, name?: string) => message(text, { reply: { text: askText(sid, name), fromId: 999 } });
+
+  test("the prompt", async () => {
+    const { olena } = seedCards();
+    await post(tap(`s:${olena}:email+`, CARD));
+    expect(methods()).toEqual(["answerCallbackQuery", "sendMessage"]);
+    expect(calls[1]?.payload).toMatchObject({ text: askText(olena), reply_markup: { force_reply: true } });
+  });
+
+  test("a new email is added and later payments match it", async () => {
+    const { olena } = seedCards();
+    await post(reply(" O3@Example.COM ", olena));
+    expect(fake.raw.all("SELECT email, student_id FROM payer_emails WHERE email = 'o3@example.com'")).toEqual([{ email: "o3@example.com", student_id: olena }]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.payload).toMatchObject({
+      reply_markup: ACTIVE(olena, true),
+      ...NOPREVIEW,
+    });
+    expect(String(calls[0]?.payload.text)).toBe(
+      `✅ Added o3@example.com to Olena.\n${olenaCard(5, "@olena_k", "Olena", "o2@example.com, o3@example.com, olena@example.com")}`,
+    );
+
+    const send = vi.fn().mockResolvedValue({ messageId: 9 });
+    await makeOnPaymentReceived({ notifier: { send }, store })(payment({ customerEmail: "o3@example.com" }, "cs_9"));
+    expect(String(send.mock.calls[0]?.[0]).startsWith(`💶 Olena paid ${EUR}`)).toBe(true);
+  });
+
+  test("an email already theirs is noted, nothing changes", async () => {
+    const { olena } = seedCards();
+    await post(reply("o2@example.com", olena));
+    expect(String(calls[0]?.payload.text).startsWith("o2@example.com is already Olena's email.\n👤 Olena")).toBe(true);
+    expect(dump()[0]?.e).toBe(3);
+  });
+
+  test("another Student's email is refused and stays", async () => {
+    const { olena, ira } = seedCards();
+    await post(reply("IRA@example.com", olena));
+    expect(calls.map((c) => c.payload.text)).toEqual(["ira@example.com already belongs to Ira + Pasha."]);
+    expect(calls[0]?.payload.reply_markup).toBeUndefined();
+    expect(fake.raw.all("SELECT student_id FROM payer_emails WHERE email = 'ira@example.com'")).toEqual([{ student_id: ira }]);
+  });
+
+  test.each(["not-an-email", "a@b"])("%s is not an address", async (text) => {
+    const { olena } = seedCards();
+    const before = dump();
+    await post(reply(text, olena));
+    expect(calls.map((c) => c.payload.text)).toEqual(["That does not look like an email address."]);
+    expect(dump()).toEqual(before);
+  });
+
+  test("an unknown Student", async () => {
+    seedCards();
+    const before = dump();
+    await post(reply("x@example.com", 999, "Ghost"));
+    expect(calls.map((c) => c.payload.text)).toEqual(["Student #999 not found."]);
+    expect(dump()).toEqual(before);
+  });
+});
+
+describe("email removal on the card", () => {
+  test("the email keyboard and Back", async () => {
+    const { olena, old } = seedCards();
+    await post(tap(`s:${olena}:email-`, CARD));
+    expect(methods()).toEqual(["answerCallbackQuery", "editMessageText"]);
+    expect(calls[0]?.payload.text).toBeUndefined();
+    expect(edited()?.payload).toMatchObject({
+      message_id: 60,
+      text: olenaCard(),
+      reply_markup: {
+        inline_keyboard: [
+          buttonRow([`✖️ o2@example.com`, `s:${olena}:rm:e5bb3129`]),
+          buttonRow([`✖️ olena@example.com`, `s:${olena}:rm:7007e771`]),
+          buttonRow(["⬅️ Back", `s:${olena}:card`]),
+        ],
+      },
+    });
+
+    calls.length = 0;
+    await post(tap(`s:${olena}:card`, CARD));
+    expect(edited()?.payload).toMatchObject({ message_id: 60, text: olenaCard(), reply_markup: ACTIVE(olena, true) });
+
+    calls.length = 0;
+    await post(tap(`s:${old}:email-`, CARD));
+    expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+    expect(edited()?.payload).toMatchObject({ reply_markup: ARCHIVED(old, false) });
+  });
+
+  test("removes one email, then the last one", async () => {
+    const { olena, ira } = seedCards();
+    await post(tap(`s:${olena}:rm:e5bb3129`, CARD));
+    expect(fake.raw.all(`SELECT email FROM payer_emails WHERE student_id = ${olena}`)).toEqual([{ email: "olena@example.com" }]);
+    expect(calls[0]?.payload.text).toBeUndefined();
+    expect(edited()?.payload).toMatchObject({ text: olenaCard(5, "@olena_k", "Olena", "olena@example.com"), reply_markup: ACTIVE(olena, true) });
+
+    calls.length = 0;
+    const before = dump();
+    await post(tap(`s:${olena}:rm:e5bb3129`, CARD));
+    expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+    expect(edited()?.payload.text).toBe(olenaCard(5, "@olena_k", "Olena", "olena@example.com"));
+    expect(dump()).toEqual(before);
+
+    calls.length = 0;
+    await post(tap(`s:${olena}:rm:7007e771`, CARD));
+    expect(edited()?.payload).toMatchObject({ text: olenaCard(5, "@olena_k", "Olena", "none"), reply_markup: ACTIVE(olena, false) });
+
+    calls.length = 0;
+    await post(tap(`s:${olena}:rm:7fc48b74`, CARD));
+    expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+    expect(fake.raw.all(`SELECT email FROM payer_emails WHERE student_id = ${ira}`)).toEqual([{ email: "ira@example.com" }]);
+  });
+
+  test("a tag collision never deletes", async () => {
+    const lone = addStudent(fake, "Lone", { emails: ["u31992@example.com", "u605430@example.com"] });
+    await post(tap(`s:${lone}:rm:120680e9`, CARD));
+    expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+    expect(edited()?.payload.text).toBe(CARD_TEXT("Lone", 0, "u31992@example.com, u605430@example.com", "not set"));
+    expect(fake.raw.all(`SELECT email FROM payer_emails WHERE student_id = ${lone}`)).toHaveLength(2);
+  });
+
+  test("an email moved to someone else after the card read is Already handled", async () => {
+    const { olena, ira } = seedCards();
+    let ran = 0;
+    fake.beforeNextBatch(() => {
+      ran += 1;
+      fake.raw.run("UPDATE payer_emails SET student_id = ?1 WHERE email = 'o2@example.com'", ira);
+    });
+    await post(tap(`s:${olena}:rm:e5bb3129`, CARD));
+    expect(ran).toBe(1);
+    expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
+    expect(edited()?.payload).toMatchObject({
+      text: olenaCard(5, "@olena_k", "Olena", "olena@example.com"),
+      reply_markup: ACTIVE(olena, true),
+    });
+    expect(fake.raw.all("SELECT student_id FROM payer_emails WHERE email = 'o2@example.com'")).toEqual([{ student_id: ira }]);
+  });
+});
+
+describe("username on the card", () => {
+  const askText = (sid: number, name = "Olena") => `Telegram username for student #${sid} (${name}), or - to clear:`;
+  const reply = (text: string, sid: number, name?: string) => message(text, { reply: { text: askText(sid, name), fromId: 999 } });
+  const stored = (sid: number) => fake.raw.all(`SELECT telegram_username FROM students WHERE id = ${sid}`)[0]?.telegram_username;
+
+  test("the prompt", async () => {
+    const { olena } = seedCards();
+    await post(tap(`s:${olena}:user`, CARD));
+    expect(calls[1]?.payload).toMatchObject({ text: askText(olena), reply_markup: { force_reply: true } });
+  });
+
+  test.each([
+    ["@Olena_K2", "Olena_K2", "✅ Saved @Olena_K2 for Olena.", "Telegram: @Olena_K2"],
+    ["olena_k3", "olena_k3", "✅ Saved @olena_k3 for Olena.", "Telegram: @olena_k3"],
+    ["abcd", "abcd", "✅ Saved @abcd for Olena.", "Telegram: @abcd"],
+    ["-", null, "✅ Cleared Olena's Telegram username.", "Telegram: not set"],
+  ])("%j is accepted", async (text, expectedStored, note, line) => {
+    const { olena } = seedCards();
+    await post(reply(text, olena));
+    expect(stored(olena)).toBe(expectedStored);
+    expect(calls).toHaveLength(1);
+    const lines = String(calls[0]?.payload.text).split("\n");
+    expect(lines[0]).toBe(note);
+    expect(lines.at(-1)).toBe(line);
+    expect(calls[0]?.payload.entities).toBeUndefined();
+    expect(calls[0]?.payload).toMatchObject({ reply_markup: ACTIVE(olena, true), ...NOPREVIEW });
+  });
+
+  test.each(["abc", "1abcd", "has space", "@@olena_k", "a".repeat(33)])("%j is refused", async (text) => {
+    const { olena } = seedCards();
+    await post(reply(text, olena));
+    expect(calls.map((c) => c.payload.text)).toEqual(["A username is 4-32 letters, digits or underscores, starting with a letter."]);
+    expect(stored(olena)).toBe("olena_k");
+  });
+
+  test("an unknown Student", async () => {
+    seedCards();
+    await post(reply("olena_k", 999, "Ghost"));
+    expect(calls.map((c) => c.payload.text)).toEqual(["Student #999 not found."]);
+  });
+});
+
+describe("editing an Archived Student", () => {
+  test("rename, username and email keep them archived", async () => {
+    const { old } = seedCards();
+    const ask = (kind: string, name: string, tail = ":") => ({ text: `${kind} student #${old} (${name})${tail}`, fromId: 999 });
+
+    await post(message("Old Two", { reply: ask("New name for", "Old One") }));
+    expect(fake.raw.all(`SELECT name, name_key, archived FROM students WHERE id = ${old}`)).toEqual([{ name: "Old Two", name_key: "old two", archived: 1 }]);
+    expect(calls[0]?.payload).toMatchObject({
+      text: `✅ Renamed Old One to Old Two.\n${CARD_TEXT("Old Two", 0, "none", "not set", true)}`,
+      reply_markup: ARCHIVED(old, false),
+    });
+
+    calls.length = 0;
+    await post(message("old_one", { reply: ask("Telegram username for", "Old Two", ", or - to clear:") }));
+    expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${old}`)).toEqual([{ archived: 1 }]);
+    expect(String(calls[0]?.payload.text).split("\n")[1]).toBe("👤 Old Two (archived)");
+
+    calls.length = 0;
+    await post(message("old@example.com", { reply: ask("Email to add for", "Old Two") }));
+    expect(fake.raw.all("SELECT email, student_id FROM payer_emails WHERE email = 'old@example.com'")).toEqual([{ email: "old@example.com", student_id: old }]);
+    expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${old}`)).toEqual([{ archived: 1 }]);
+    expect(String(calls[0]?.payload.text).split("\n")[1]).toBe("👤 Old Two (archived)");
+  });
+});
+
+describe("archive on the card", () => {
+  test("archive, list changes, unarchive", async () => {
+    const { olena } = seedCards();
+    await post(tap(`s:${olena}:archive`, CARD));
+    expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${olena}`)).toEqual([{ archived: 1 }]);
+    expect(calls[0]?.payload.text).toBeUndefined();
+    expect(edited()?.payload).toMatchObject({
+      text: CARD_TEXT("Olena", 5, OLENA_EMAILS, "@olena_k", true),
+      reply_markup: ARCHIVED(olena, true),
+      ...NOPREVIEW,
+    });
+
+    calls.length = 0;
+    await post(message("/students"));
+    expect(String(calls[0]?.payload.text)).not.toContain("Olena");
+    calls.length = 0;
+    await post(message("/archived"));
+    expect(String(calls[0]?.payload.text)).toContain("Olena: 5");
+
+    const send = vi.fn().mockResolvedValue({ messageId: 9 });
+    await makeOnPaymentReceived({ notifier: { send }, store })(payment({ customerEmail: "nobody@example.com" }, "cs_7"));
+    const buttons = (send.mock.calls[0]?.[1] as { buttons: { text: string }[][] }).buttons.flat().map((b) => b.text);
+    expect(buttons).not.toContain("Olena");
+
+    calls.length = 0;
+    await post(tap(`s:${olena}:unarchive`, CARD));
+    expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${olena}`)).toEqual([{ archived: 0 }]);
+    expect(edited()?.payload).toMatchObject({ reply_markup: ACTIVE(olena, true) });
+  });
+
+  test("a second archive is Already handled even when the edit is not modified", async () => {
+    const { olena } = seedCards();
+    await post(tap(`s:${olena}:archive`, CARD));
+    respond = (method) => (method === "editMessageText" ? { ok: false, error_code: 400, description: "Bad Request: message is not modified" } : { ok: true, result: true });
+    calls.length = 0;
+    const before = dump();
+    const res = await post(tap(`s:${olena}:archive`, CARD));
+    expect(res.status).toBe(200);
+    expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
+    expect(dump()).toEqual(before);
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  test("an unknown Student", async () => {
+    seedCards();
+    await post(tap("s:999:archive", CARD));
+    onlyNotFound();
+  });
+});
+
+describe("prompt replies are bound to the bot and the contract", () => {
+  test("a reply to a prompt sent by someone else changes nothing", async () => {
+    const { olena } = seedCards();
+    await post(message("Olena K", { reply: { text: `New name for student #${olena} (Olena):`, fromId: 5 } }));
+    expect(fake.raw.all(`SELECT name FROM students WHERE id = ${olena}`)).toEqual([{ name: "Olena" }]);
+    noCalls();
+  });
+
+  test("a command replied to a prompt is not an answer", async () => {
+    const { olena } = seedCards();
+    await post(message("/students", { reply: { text: `New name for student #${olena} (Olena):`, fromId: 999 } }));
+    expect(fake.raw.all(`SELECT name FROM students WHERE id = ${olena}`)).toEqual([{ name: "Olena" }]);
+    expect(calls.map((c) => String(c.payload.text).includes("Renamed"))).toEqual([false]);
+  });
+
+  test("a new-student prompt with a 17-digit id is ignored", async () => {
+    await seedPayment();
+    const before = dump();
+    await post(message("Marie", { reply: { text: "Name for the new student (payment #12345678901234567):", fromId: 999 } }));
+    noCalls();
+    expect(dump()).toEqual(before);
+  });
+});
+
 describe("Balance error paths", () => {
   const expectSafeFailure = async (update: { update_id: number }) => {
     const res = await post(update);
@@ -872,6 +1369,74 @@ describe("Balance error paths", () => {
       }
     }
   };
+
+  describe("Student card failures", () => {
+    const expectNoLeak = () => {
+      for (const arg of logged()) {
+        for (const text of [String(arg), JSON.stringify(arg)]) {
+          for (const secret of ["o2@example.com", "olena_k"]) expect(text).not.toContain(secret);
+        }
+      }
+    };
+    const emailsOf = () => fake.raw.all("SELECT email FROM payer_emails ORDER BY email").map((r) => r.email);
+    const olenaRow = (id: number) => fake.raw.all(`SELECT name, archived, telegram_username FROM students WHERE id = ${id}`);
+
+    test("opening a card when the read fails sends nothing", async () => {
+      const { olena } = seedCards();
+      fake.failNext("first");
+      await expectSafeFailure(tap(`s:${olena}:open`, CARD));
+      expect(calls).toHaveLength(0);
+      expectNoLeak();
+    });
+
+    test("a -1 whose batch fails writes nothing", async () => {
+      const { olena } = seedCards();
+      const rowsBefore = adjustmentRows();
+      fake.failNext("batch");
+      await expectSafeFailure(tap(`s:${olena}:-1`, CARD));
+      expect(calls).toHaveLength(0);
+      expect(adjustmentRows()).toEqual(rowsBefore);
+      expectNoLeak();
+    });
+
+    test("a +1 committed before the card read fails is accepted", async () => {
+      const { olena } = seedCards();
+      const rowsBefore = adjustmentRows().length;
+      fake.failNext("first");
+      await expectSafeFailure(tap(`s:${olena}:+1`, CARD));
+      expect(calls).toHaveLength(0);
+      expect(adjustmentRows()).toHaveLength(rowsBefore + 1);
+      expectNoLeak();
+    });
+
+    test.each([
+      ["email removal", (olena: number) => tap(`s:${olena}:rm:e5bb3129`, CARD)],
+      ["archive", (olena: number) => tap(`s:${olena}:archive`, CARD)],
+      ["rename reply", (olena: number) => message("Olena K", { reply: { text: `New name for student #${olena} (Olena):`, fromId: 999 } })],
+      ["add email reply", (olena: number) => message("o3@example.com", { reply: { text: `Email to add for student #${olena} (Olena):`, fromId: 999 } })],
+    ])("a failing %s batch changes nothing", async (_n, build) => {
+      const { olena } = seedCards();
+      const emailsBefore = emailsOf();
+      fake.failNext("batch");
+      await expectSafeFailure(build(olena));
+      expect(calls).toHaveLength(0);
+      expect(emailsOf()).toEqual(emailsBefore);
+      expect(emailsOf()).toContain("o2@example.com");
+      expect(emailsOf()).toContain("olena@example.com");
+      expect(emailsOf()).not.toContain("o3@example.com");
+      expect(olenaRow(olena)).toEqual([{ name: "Olena", archived: 0, telegram_username: "olena_k" }]);
+      expectNoLeak();
+    });
+
+    test("a failing username write keeps the username", async () => {
+      const { olena } = seedCards();
+      fake.failNext("all");
+      await expectSafeFailure(message("Olena_K2", { reply: { text: `Telegram username for student #${olena} (Olena), or - to clear:`, fromId: 999 } }));
+      expect(calls).toHaveLength(0);
+      expect(olenaRow(olena)).toEqual([{ name: "Olena", archived: 0, telegram_username: "olena_k" }]);
+      expectNoLeak();
+    });
+  });
 
   test("a D1 failure on a -1 / +1 write", async () => {
     const { pid } = await seedAssigned("Olena", 0);
