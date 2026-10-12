@@ -123,6 +123,13 @@ Do the steps in this order. Each secret is set once, after the step that produce
    `checkout.session.async_payment_succeeded`.
 9. Open the endpoint, reveal its signing secret (`whsec_...`) and store it with
    `pnpm exec wrangler secret put STRIPE_WEBHOOK_SECRET`.
+10. Store the Lessons calendars with `pnpm exec wrangler secret put LESSON_CALENDARS`. The value is a JSON array with one
+    entry per calendar: a short `label` (at most 32 characters, unique ignoring case) and the calendar's private
+    `https://` or `webcal://` `url`, which is a secret:
+    ```
+    [{"label":"A1-A2","url":"webcal://calendar.example/a1a2.ics"},{"label":"B2","url":"https://calendar.example/b2.ics"}]
+    ```
+    The Worker reads it from v2.2c on; setting it earlier does no harm.
 
 ### Update an existing deployment
 
@@ -132,6 +139,8 @@ Run these in order:
 2. Check the build: `pnpm exec wrangler deploy --dry-run`.
 3. Apply the pending migrations: `pnpm exec wrangler d1 migrations apply tg-bot --remote`.
 4. Deploy right away: `pnpm run deploy`.
+
+Set `LESSON_CALENDARS` once (Deploy, step 10) before v2.2c is deployed: from then on the Worker reads it.
 
 0002 dropped a column, so between migrating and deploying the old code failed every Stripe delivery (Stripe retried; dedupe by checkout session id made that safe) and showed `/test/` dashboard links. 0003 only adds columns and a table: the running Worker keeps working between steps 3 and 4.
 Never deploy before migrating: the new code then fails every Stripe delivery. A dropped column can only be restored with

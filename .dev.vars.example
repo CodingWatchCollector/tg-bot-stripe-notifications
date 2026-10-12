@@ -8,5 +8,6 @@ STRIPE_WEBHOOK_SECRET=
 TELEGRAM_WEBHOOK_SECRET=
 # Optional: where `pnpm dev:telegram` forwards updates (default http://localhost:8787/telegram/webhook).
 # DEV_WORKER_URL=
-# Spike: the published Lessons calendar link (webcal:// or https://). Test it with GET /spike/calendar.
-LESSONS_CALENDAR_URL=
+# The Owner's Lessons calendars: a JSON array of {"label", "url"}, in single quotes. webcal:// is accepted.
+# Read by the calendar reader from v2.2c on.
+LESSON_CALENDARS='[{"label":"A1-A2","url":"webcal://calendar.example/a1a2.ics"}]'

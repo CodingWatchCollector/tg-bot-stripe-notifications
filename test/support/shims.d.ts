@@ -3,6 +3,11 @@ declare module "*.sql?raw" {
   export default sql;
 }
 
+declare module "*.ics?raw" {
+  const ics: string;
+  export default ics;
+}
+
 declare module "node:sqlite" {
   type SqlValue = string | number | bigint | null;
   interface StatementSync {

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "grammy": "^1.46.0",
+    "ical.js": "2.2.1",
     "stripe": "^22.6.2"
   },
   "devDependencies": {
