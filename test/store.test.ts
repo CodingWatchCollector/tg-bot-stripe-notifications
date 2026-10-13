@@ -885,7 +885,6 @@ describe("Calendar names", () => {
   const nameRows = () => rows("SELECT title_key, student_id, title FROM calendar_names ORDER BY title_key, student_id");
   const ignoredRows = () => rows("SELECT title_key, title FROM ignored_titles ORDER BY title_key");
   const titles = (card: { calendarNames: { title: string }[] } | null) => card?.calendarNames.map((n) => n.title);
-  const inject = (sql: string, ...params: (string | number)[]) => fake.runBeforeNextBatch(sql, ...params);
 
   describe("attachTitleStatement", () => {
     test("[22b-M6] an ignored key is not attached when the statement runs alone", async () => {
@@ -973,7 +972,7 @@ describe("Calendar names", () => {
 
     test("[22b-M1] a Student archived before the batch gets archived and no row", async () => {
       const marko = addStudent(fake, "Marko");
-      const runs = inject("UPDATE students SET archived = 1 WHERE id = ?1", marko);
+      const runs = fake.runBeforeNextBatch("UPDATE students SET archived = 1 WHERE id = ?1", marko);
       const out = await store.addCalendarName(marko, "Marko");
       expect(runs.n).toBe(1);
       expect(out).toMatchObject({ kind: "archived" });
@@ -1008,7 +1007,7 @@ describe("Calendar names", () => {
 
     test("[22b-M2] a title ignored just before the batch is still attached and un-ignored", async () => {
       const marko = addStudent(fake, "Marko");
-      const runs = inject("INSERT INTO ignored_titles(title_key, title, created_at) VALUES ('prep', 'Prep', 't')");
+      const runs = fake.runBeforeNextBatch("INSERT INTO ignored_titles(title_key, title, created_at) VALUES ('prep', 'Prep', 't')");
       const out = await store.addCalendarName(marko, "Prep");
       expect(runs.n).toBe(1);
       expect(out).toMatchObject({ kind: "added", unignored: true });
@@ -1018,7 +1017,7 @@ describe("Calendar names", () => {
 
     test("the same row inserted before the batch is already_resolved with one row", async () => {
       const marko = addStudent(fake, "Marko");
-      const runs = inject("INSERT INTO calendar_names(title_key, student_id, title, created_at) VALUES ('marko', ?1, 'Marko', 't')", marko);
+      const runs = fake.runBeforeNextBatch("INSERT INTO calendar_names(title_key, student_id, title, created_at) VALUES ('marko', ?1, 'Marko', 't')", marko);
       const out = await store.addCalendarName(marko, "Marko");
       expect(runs.n).toBe(1);
       expect(out).toMatchObject({ kind: "already_resolved", title: "Marko" });

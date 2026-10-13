@@ -1519,7 +1519,6 @@ describe("Calendar names on the card", () => {
   const removalKeyboard = (sid: number, ...rows: [string, string][]) => ({
     inline_keyboard: [...rows.map((r) => buttonRow(r)), buttonRow(["\u2B05\uFE0F Back", `s:${sid}:card`])],
   });
-  const injectOnce = (sql: string, ...params: (string | number)[]) => fake.runBeforeNextBatch(sql, ...params);
   const duoLine = (others: string) => `\u2022 ${DUO}${others === "" ? "" : `, shared with ${others}`}`;
 
   let marko: number;
@@ -1652,7 +1651,7 @@ describe("Calendar names on the card", () => {
     });
 
     test("a row deleted before the batch is Already handled", async () => {
-      const runs = injectOnce("DELETE FROM calendar_names WHERE student_id = ?1 AND title_key = 'yeva'", yeva);
+      const runs = fake.runBeforeNextBatch("DELETE FROM calendar_names WHERE student_id = ?1 AND title_key = 'yeva'", yeva);
       await post(tap(`s:${yeva}:rt:${TAG_YEVA}`, CARD));
       expect(runs.n).toBe(1);
       expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
