@@ -1,3 +1,4 @@
+import { titleKey } from "../domain/calendar";
 import type { PaymentReceived } from "../domain/payment";
 import type { Product } from "../domain/products";
 import { nameKey, normalizeName, type Student } from "../domain/student";
@@ -49,9 +50,32 @@ export type AdjustStudentOutcome =
   | { kind: "adjusted"; student: Student; before: number; after: number; unarchived: boolean }
   | { kind: "not_found" };
 
+export interface CalendarNameView {
+  title: string;
+  titleKey: string;
+  sharedWith: string[];
+}
+
 export interface StudentCard extends Student {
   balance: number;
   emails: string[];
+  calendarNames: CalendarNameView[];
+}
+
+export type AddCalendarNameOutcome =
+  | { kind: "added"; card: StudentCard; title: string; sharedWith: string[]; unignored: boolean }
+  | { kind: "already_resolved"; card: StudentCard; title: string }
+  | { kind: "archived"; card: StudentCard }
+  | { kind: "not_found" };
+
+export type RemoveCalendarNameOutcome =
+  | { kind: "removed"; card: StudentCard; title: string }
+  | { kind: "already_resolved"; card: StudentCard }
+  | { kind: "not_found" };
+
+export interface TitleSets {
+  attached: Map<string, number[]>;
+  ignored: Set<string>;
 }
 
 export type RenameOutcome =
@@ -60,8 +84,8 @@ export type RenameOutcome =
   | { kind: "not_found" };
 
 export type ArchiveOutcome =
-  | { kind: "updated"; card: StudentCard }
-  | { kind: "already_resolved"; card: StudentCard }
+  | { kind: "updated"; card: StudentCard; detached: string[] }
+  | { kind: "already_resolved"; card: StudentCard; detached: string[] }
   | { kind: "not_found" };
 
 export type AddEmailOutcome =
@@ -96,6 +120,9 @@ export interface Store {
   addEmail(studentId: number, email: string): Promise<AddEmailOutcome>;
   removeEmail(studentId: number, email: string): Promise<RemoveEmailOutcome>;
   setUsername(studentId: number, username: string | null): Promise<UsernameOutcome>;
+  addCalendarName(studentId: number, title: string): Promise<AddCalendarNameOutcome>;
+  removeCalendarName(studentId: number, titleKey: string): Promise<RemoveCalendarNameOutcome>;
+  getTitleSets(): Promise<TitleSets>;
 }
 
 type Row = Record<string, unknown>;
@@ -147,6 +174,25 @@ const saveEmailSql = (studentIdSql: string): string => `INSERT INTO payer_emails
   WHERE id = ?1 AND status = 'assigned' AND student_id = ${studentIdSql} AND customer_email IS NOT NULL
   ON CONFLICT(email) DO NOTHING`;
 
+const titleCollator = new Intl.Collator("en", { sensitivity: "base" });
+
+export function calendarNameParts(input: string): { title: string; key: string } {
+  const title = normalizeName(input.normalize("NFC"));
+  const key = titleKey(title);
+  if (key === "") throw new Error("calendar name is empty");
+  return { title, key };
+}
+
+// Guards stay in the statement so v2.2d can batch it: an archived Student and an Ignored key both insert nothing.
+export function attachTitleStatement(db: D1Database, studentId: number, title: string, createdAt: string): D1PreparedStatement {
+  const { title: clean, key } = calendarNameParts(title);
+  return db
+    .prepare(
+      "INSERT INTO calendar_names(title_key, student_id, title, created_at) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM students WHERE id = ?2 AND archived = 0) AND NOT EXISTS (SELECT 1 FROM ignored_titles WHERE title_key = ?1) ON CONFLICT(title_key, student_id) DO NOTHING RETURNING title_key",
+    )
+    .bind(key, studentId, clean, createdAt);
+}
+
 export function createStore(db: D1Database): Store {
   const now = () => new Date().toISOString();
 
@@ -182,7 +228,26 @@ export function createStore(db: D1Database): Store {
     const r = await one(`SELECT s.*, ${balanceSql("s.id")} AS balance FROM students s WHERE s.id = ?1`, id);
     if (r === null) return null;
     const { results } = await db.prepare("SELECT email FROM payer_emails WHERE student_id = ?1 ORDER BY email").bind(id).all<Row>();
-    return { ...toStudent(r), balance: r.balance as number, emails: results.map((e) => e.email as string) };
+    const names = await db
+      .prepare(
+        `SELECT c.title_key, c.title, o.name AS other FROM calendar_names c
+         LEFT JOIN calendar_names x ON x.title_key = c.title_key AND x.student_id <> c.student_id
+         LEFT JOIN students o ON o.id = x.student_id AND o.archived = 0
+         WHERE c.student_id = ?1`,
+      )
+      .bind(id)
+      .all<Row>();
+    const byKey = new Map<string, CalendarNameView>();
+    for (const n of names.results) {
+      const key = n.title_key as string;
+      const view = byKey.get(key) ?? { title: n.title as string, titleKey: key, sharedWith: [] };
+      if (n.other !== null) view.sharedWith.push(n.other as string);
+      byKey.set(key, view);
+    }
+    const calendarNames = [...byKey.values()]
+      .map((v) => ({ ...v, sharedWith: v.sharedWith.sort(titleCollator.compare) }))
+      .sort((a, b) => titleCollator.compare(a.title, b.title) || (a.titleKey < b.titleKey ? -1 : a.titleKey > b.titleKey ? 1 : 0));
+    return { ...toStudent(r), balance: r.balance as number, emails: results.map((e) => e.email as string), calendarNames };
   }
 
   async function committedCard(id: number): Promise<StudentCard> {
@@ -238,12 +303,14 @@ export function createStore(db: D1Database): Store {
     },
 
     async setArchived(studentId, archived) {
-      const [update] = await db.batch([
+      const [update, detach] = await db.batch([
         db.prepare("UPDATE students SET archived = ?1 WHERE id = ?2 AND archived <> ?1 RETURNING id").bind(archived ? 1 : 0, studentId),
+        ...(archived ? [db.prepare("DELETE FROM calendar_names WHERE student_id = ?1 RETURNING title").bind(studentId)] : []),
       ]);
       const card = await cardById(studentId);
       if (card === null) return { kind: "not_found" };
-      return update?.results.length === 1 ? { kind: "updated", card } : { kind: "already_resolved", card };
+      const detached = (detach?.results ?? []).map((r) => (r as Row).title as string).sort(titleCollator.compare);
+      return update?.results.length === 1 ? { kind: "updated", card, detached } : { kind: "already_resolved", card, detached };
     },
 
     async addEmail(studentId, email) {
@@ -280,6 +347,51 @@ export function createStore(db: D1Database): Store {
         .all<Row>();
       if (results.length !== 1) return { kind: "not_found" };
       return { kind: "updated", card: await committedCard(studentId) };
+    },
+
+    async addCalendarName(studentId, input) {
+      const { title, key } = calendarNameParts(input);
+      const [unignore, insert] = await db.batch([
+        db.prepare("DELETE FROM ignored_titles WHERE title_key = ?1 AND EXISTS (SELECT 1 FROM students WHERE id = ?2 AND archived = 0) RETURNING title_key").bind(key, studentId),
+        attachTitleStatement(db, studentId, title, now()),
+      ]);
+      if (insert?.results.length === 1) {
+        const card = await committedCard(studentId);
+        const sharedWith = card.calendarNames.find((n) => n.titleKey === key)?.sharedWith ?? [];
+        return { kind: "added", card, title, sharedWith, unignored: unignore?.results.length === 1 };
+      }
+      const card = await cardById(studentId);
+      if (card === null) return { kind: "not_found" };
+      if (card.archived) return { kind: "archived", card };
+      const stored = card.calendarNames.find((n) => n.titleKey === key);
+      if (stored === undefined) throw new Error("calendar name insert ignored without a reason");
+      return { kind: "already_resolved", card, title: stored.title };
+    },
+
+    async removeCalendarName(studentId, key) {
+      const [del] = await db.batch([
+        db.prepare("DELETE FROM calendar_names WHERE title_key = ?1 AND student_id = ?2 RETURNING title").bind(key, studentId),
+      ]);
+      const card = await cardById(studentId);
+      if (card === null) return { kind: "not_found" };
+      const row = del?.results[0] as Row | undefined;
+      return row === undefined ? { kind: "already_resolved", card } : { kind: "removed", card, title: row.title as string };
+    },
+
+    async getTitleSets() {
+      const names = await db
+        .prepare(
+          `SELECT c.title_key, c.student_id FROM calendar_names c JOIN students s ON s.id = c.student_id
+           WHERE s.archived = 0 ORDER BY c.title_key, c.student_id`,
+        )
+        .all<Row>();
+      const ignored = await db.prepare("SELECT title_key FROM ignored_titles").all<Row>();
+      const attached = new Map<string, number[]>();
+      for (const r of names.results) {
+        const key = r.title_key as string;
+        attached.set(key, [...(attached.get(key) ?? []), r.student_id as number]);
+      }
+      return { attached, ignored: new Set(ignored.results.map((r) => r.title_key as string)) };
     },
 
     getStudentCard: cardById,

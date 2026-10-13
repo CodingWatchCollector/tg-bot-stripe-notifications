@@ -4,16 +4,19 @@ import { emailTag, parseCallback, type Callback } from "../app/callbacks";
 import { helpText } from "../app/commands";
 import {
   adjustText,
+  archiveConfirmMessage,
   archivedText,
   cardMessage,
   emailRemovalButtons,
   paymentMessage,
   studentListButtons,
   studentsText,
+  titleRemovalButtons,
   unarchivedLine,
 } from "../app/messages";
 import { newStudentPrompt, parsePrompt, promptText } from "../app/prompts";
 import type { AssignOutcome, DismissOutcome, Store, StudentCard } from "../db/store";
+import { isValidCalendarName } from "../domain/calendar";
 import {
   isValidEmail,
   isValidName,
@@ -31,6 +34,7 @@ const MAX_ADJUST_CANDIDATES = 10;
 const ADJUST_USAGE = "Usage: /adjust Name +5 [reason]";
 const INVALID_EMAIL = "That does not look like an email address.";
 const INVALID_USERNAME = "A username is 4-32 letters, digits or underscores, starting with a letter.";
+const INVALID_TITLE = "A calendar name is 1-100 characters and cannot start with \u274C, contain (підрядниця) or contain \" \u2014 \".";
 const NO_PREVIEW = { link_preview_options: { is_disabled: true } } as const;
 
 export interface BotOptions {
@@ -204,7 +208,7 @@ export function createBot(opts: BotOptions): Bot {
       return edit(cardMessage(card, note));
     };
 
-    const askFor = async (card: StudentCard, kind: "rename" | "add_email" | "username") => {
+    const askFor = async (card: StudentCard, kind: "rename" | "add_email" | "username" | "add_title") => {
       await answer();
       await ctx.api.sendMessage(opts.chatId, promptText({ kind, studentId: card.id }, card.name), { reply_markup: { force_reply: true } });
     };
@@ -214,6 +218,22 @@ export function createBot(opts: BotOptions): Bot {
       const withCard = async (use: (card: StudentCard) => Promise<unknown>) => {
         const card = await store.getStudentCard(studentId);
         return card === null ? answer("Not found") : use(card);
+      };
+      const archive = async () => {
+        const outcome = await store.setArchived(studentId, true);
+        switch (outcome.kind) {
+          case "not_found":
+            return answer("Not found");
+          case "updated":
+          case "already_resolved": {
+            const note = outcome.detached.length === 0 ? undefined : `Detached calendar names: ${outcome.detached.join(", ")}.`;
+            return editCard(outcome.card, outcome.kind === "updated" ? undefined : "Already handled", note);
+          }
+          default: {
+            const unreachable: never = outcome;
+            return unreachable;
+          }
+        }
       };
       switch (tap.action) {
         case "-1":
@@ -233,9 +253,17 @@ export function createBot(opts: BotOptions): Bot {
             }
           }
         }
-        case "archive":
+        case "archive": {
+          const card = await store.getStudentCard(studentId);
+          if (card === null) return answer("Not found");
+          if (card.archived || card.calendarNames.length === 0) return archive();
+          await answer();
+          return edit(archiveConfirmMessage(card));
+        }
+        case "archive!":
+          return archive();
         case "unarchive": {
-          const outcome = await store.setArchived(studentId, tap.action === "archive");
+          const outcome = await store.setArchived(studentId, false);
           switch (outcome.kind) {
             case "not_found":
               return answer("Not found");
@@ -268,6 +296,14 @@ export function createBot(opts: BotOptions): Bot {
             if (card.emails.length === 0) return editCard(card, "Not found");
             await answer();
             return edit({ text: cardMessage(card).text, buttons: emailRemovalButtons(card) });
+          });
+        case "title+":
+          return withCard(async (card) => (card.archived ? answer("Archived") : askFor(card, "add_title")));
+        case "title-":
+          return withCard(async (card) => {
+            if (card.calendarNames.length === 0) return editCard(card, "Not found");
+            await answer();
+            return edit({ text: cardMessage(card).text, buttons: titleRemovalButtons(card) });
           });
         default: {
           const unreachable: never = tap.action;
@@ -312,6 +348,26 @@ export function createBot(opts: BotOptions): Bot {
         const [email] = matches;
         if (matches.length !== 1 || email === undefined) return editCard(card, "Not found");
         const outcome = await store.removeEmail(cb.studentId, email);
+        switch (outcome.kind) {
+          case "removed":
+            return editCard(outcome.card);
+          case "already_resolved":
+            return editCard(outcome.card, "Already handled");
+          case "not_found":
+            return answer("Not found");
+          default: {
+            const unreachable: never = outcome;
+            return unreachable;
+          }
+        }
+      }
+      case "remove_title": {
+        const card = await store.getStudentCard(cb.studentId);
+        if (card === null) return answer("Not found");
+        const matches = card.calendarNames.filter((n) => emailTag(n.titleKey) === cb.tag);
+        const [name] = matches;
+        if (matches.length !== 1 || name === undefined) return editCard(card, "Not found");
+        const outcome = await store.removeCalendarName(cb.studentId, name.titleKey);
         switch (outcome.kind) {
           case "removed":
             return editCard(outcome.card);
@@ -421,6 +477,31 @@ export function createBot(opts: BotOptions): Bot {
                 ? `✅ Cleared ${outcome.card.name}'s Telegram username.`
                 : `✅ Saved @${parsed.username} for ${outcome.card.name}.`,
             );
+          case "not_found":
+            return void (await notFound(prompt.studentId));
+          default: {
+            const unreachable: never = outcome;
+            return unreachable;
+          }
+        }
+      }
+      case "add_title": {
+        if (!isValidCalendarName(text)) return void (await ctx.reply(INVALID_TITLE));
+        const outcome = await store.addCalendarName(prompt.studentId, text);
+        switch (outcome.kind) {
+          case "added": {
+            const base = `✅ Added calendar name ${outcome.title} to ${outcome.card.name}.`;
+            const extra = outcome.unignored
+              ? " It was marked Not a lesson; its events now count as Lessons."
+              : outcome.sharedWith.length > 0
+                ? ` Shared with ${outcome.sharedWith.join(", ")}.`
+                : "";
+            return replyCard(outcome.card, base + extra);
+          }
+          case "already_resolved":
+            return replyCard(outcome.card, `${outcome.title} is already ${outcome.card.name}'s calendar name.`);
+          case "archived":
+            return void (await ctx.reply(`${outcome.card.name} is archived. Unarchive them first.`));
           case "not_found":
             return void (await notFound(prompt.studentId));
           default: {

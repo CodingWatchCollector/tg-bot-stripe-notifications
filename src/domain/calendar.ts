@@ -1,4 +1,4 @@
-import { nameKey } from "./student";
+import { nameKey, normalizeName } from "./student";
 
 export interface Occurrence {
   calendar: string;
@@ -23,6 +23,19 @@ export const titleKey = (title: string): string => nameKey(title.normalize("NFC"
 const CONTRACT_MARK = "(підрядниця)";
 const CANCEL_MARK = /^\u274C\uFE0F?/;
 const CANCEL_SEPARATOR = " — ";
+
+// A name the classifier would treat as a cancelled or contract title could never match its own Lessons.
+export function isValidCalendarName(text: string): boolean {
+  const t = normalizeName(text.normalize("NFC"));
+  const length = [...t].length;
+  return (
+    length >= 1 &&
+    length <= 100 &&
+    !CANCEL_MARK.test(t) &&
+    !t.toLowerCase().includes(CONTRACT_MARK) &&
+    !t.includes(CANCEL_SEPARATOR)
+  );
+}
 
 export function classifyOccurrence(
   o: Pick<Occurrence, "title" | "allDay">,

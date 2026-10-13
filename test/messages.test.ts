@@ -3,7 +3,9 @@ import {
   archivedText,
   assignedText,
   cardMessage,
+  archiveConfirmMessage,
   emailRemovalButtons,
+  titleRemovalButtons,
   studentListButtons,
   customerLine,
   dashboardLink,
@@ -447,11 +449,12 @@ describe("cardMessage", () => {
     createdAt: "t",
     balance: 5,
     emails: ["o2@example.com", "olena@example.com"],
+    calendarNames: [],
   };
 
   test("an active card", () => {
     expect(cardMessage(card)).toEqual({
-      text: "👤 Olena\nBalance: 5\nEmails: o2@example.com, olena@example.com\nTelegram: @olena_k",
+      text: "👤 Olena\nBalance: 5\nEmails: o2@example.com, olena@example.com\nTelegram: @olena_k\nCalendar names: none",
       buttons: [
         [
           { text: "-1", data: "s:4:-1" },
@@ -465,6 +468,7 @@ describe("cardMessage", () => {
           { text: "➕ Email", data: "s:4:email+" },
           { text: "➖ Email", data: "s:4:email-" },
         ],
+        [{ text: "➕ Calendar name", data: "s:4:title+" }],
         [{ text: "🗄 Archive", data: "s:4:archive" }],
       ],
     });
@@ -472,9 +476,41 @@ describe("cardMessage", () => {
 
   test("an archived card without emails or username", () => {
     const out = cardMessage({ ...card, archived: true, emails: [], telegramUsername: null, balance: 0, name: "Old One" });
-    expect(out.text).toBe("👤 Old One (archived)\nBalance: 0\nEmails: none\nTelegram: not set");
+    expect(out.text).toBe("👤 Old One (archived)\nBalance: 0\nEmails: none\nTelegram: not set\nCalendar names: none");
     expect(out.buttons.map((row) => row.map((b) => b.text))).toEqual([["-1", "+1"], ["✏️ Rename", "👤 Username"], ["➕ Email"], ["📤 Unarchive"]]);
     expect(out.buttons[3]).toEqual([{ text: "📤 Unarchive", data: "s:4:unarchive" }]);
+  });
+
+  describe("Calendar names", () => {
+    const DUO = "Duo B2/C1 (Mira K, Yeva)";
+    const duo = { title: DUO, titleKey: "duo b2/c1 (mira k, yeva)", sharedWith: ["Yeva"] };
+    const marko = { title: "Marko", titleKey: "marko", sharedWith: [] };
+    const labels = (out: ReturnType<typeof cardMessage>) => out.buttons.map((row) => row.map((b) => b.text));
+
+    test("lists each name with who it is shared with", () => {
+      const out = cardMessage({ ...card, calendarNames: [duo, marko] });
+      expect(out.text.split("\n").slice(-3)).toEqual(["Calendar names:", `\u2022 ${DUO}, shared with Yeva`, "\u2022 Marko"]);
+      expect(labels(out)[3]).toEqual(["\u2795 Calendar name", "\u2796 Calendar name"]);
+      expect(out.buttons[3]).toEqual([
+        { text: "\u2795 Calendar name", data: "s:4:title+" },
+        { text: "\u2796 Calendar name", data: "s:4:title-" },
+      ]);
+    });
+
+    test("joins several Students", () => {
+      const out = cardMessage({ ...card, calendarNames: [{ ...duo, sharedWith: ["Mira K", "Taras"] }] });
+      expect(out.text.split("\n").at(-1)).toBe(`\u2022 ${DUO}, shared with Mira K, Taras`);
+    });
+
+    test("an archived card with no names has no Calendar name row", () => {
+      const out = cardMessage({ ...card, archived: true });
+      expect(labels(out)).toEqual([["-1", "+1"], ["\u270F\uFE0F Rename", "\u{1F464} Username"], ["\u2795 Email", "\u2796 Email"], ["\u{1F4E4} Unarchive"]]);
+    });
+
+    test("an archived card with a leftover name can only remove it", () => {
+      const out = cardMessage({ ...card, archived: true, calendarNames: [marko] });
+      expect(labels(out).slice(3)).toEqual([["\u2796 Calendar name"], ["\u{1F4E4} Unarchive"]]);
+    });
   });
 
   test("a note is the first line", () => {
@@ -490,6 +526,49 @@ describe("emailRemovalButtons", () => {
       [{ text: "✖️ olena@example.com", data: "s:4:rm:7007e771" }],
       [{ text: "⬅️ Back", data: "s:4:card" }],
     ]);
+  });
+});
+
+describe("titleRemovalButtons", () => {
+  test("one row per name, then Back", () => {
+    const card = {
+      id: 4,
+      calendarNames: [
+        { title: "Duo B2/C1 (Mira K, Yeva)", titleKey: "duo b2/c1 (mira k, yeva)", sharedWith: ["Yeva"] },
+        { title: "Marko", titleKey: "marko", sharedWith: [] },
+      ],
+    } as StudentCard;
+    const rows = titleRemovalButtons(card);
+    expect(rows.map((r) => r.map((b) => b.text))).toEqual([
+      ["\u2716\uFE0F Duo B2/C1 (Mira K, Yeva)"],
+      ["\u2716\uFE0F Marko"],
+      ["\u2B05\uFE0F Back"],
+    ]);
+    expect(rows.map((r) => r[0]?.data)).toEqual([
+      "s:4:rt:28b125b6",
+      "s:4:rt:d57631dd",
+      "s:4:card",
+    ]);
+  });
+});
+
+describe("archiveConfirmMessage", () => {
+  test("names what is detached and offers Back", () => {
+    const card = {
+      id: 4,
+      name: "Yeva",
+      calendarNames: [
+        { title: "Duo B2/C1 (Mira K, Yeva)", titleKey: "k1", sharedWith: ["Mira K"] },
+        { title: "Yeva", titleKey: "yeva", sharedWith: [] },
+      ],
+    } as StudentCard;
+    expect(archiveConfirmMessage(card)).toEqual({
+      text: "Archive Yeva? This detaches their calendar names: Duo B2/C1 (Mira K, Yeva), Yeva. Unarchiving does not bring them back.",
+      buttons: [
+        [{ text: "\u{1F5C4} Archive and detach", data: "s:4:archive!" }],
+        [{ text: "\u2B05\uFE0F Back", data: "s:4:card" }],
+      ],
+    });
   });
 });
 

@@ -153,6 +153,12 @@ const cardText = (card: StudentCard, note?: string): string =>
     `Balance: ${card.balance}`,
     `Emails: ${card.emails.length === 0 ? "none" : card.emails.join(", ")}`,
     `Telegram: ${card.telegramUsername === null ? "not set" : `@${card.telegramUsername}`}`,
+    ...(card.calendarNames.length === 0
+      ? ["Calendar names: none"]
+      : [
+          "Calendar names:",
+          ...card.calendarNames.map((n) => `\u2022 ${n.title}${n.sharedWith.length === 0 ? "" : `, shared with ${n.sharedWith.join(", ")}`}`),
+        ]),
   ].join("\n");
 
 export function cardMessage(card: StudentCard, note?: string): { text: string; buttons: Button[][] } {
@@ -160,20 +166,44 @@ export function cardMessage(card: StudentCard, note?: string): { text: string; b
     text,
     data: callbackData({ kind: "student", studentId: card.id, action }),
   });
+  const titleRow = [
+    ...(card.archived ? [] : [button("\u2795 Calendar name", "title+")]),
+    ...(card.calendarNames.length > 0 ? [button("\u2796 Calendar name", "title-")] : []),
+  ];
   return {
     text: cardText(card, note),
     buttons: [
       [button("-1", "-1"), button("+1", "+1")],
       [button("✏️ Rename", "name"), button("👤 Username", "user")],
       [button("➕ Email", "email+"), ...(card.emails.length > 0 ? [button("➖ Email", "email-")] : [])],
+      ...(titleRow.length > 0 ? [titleRow] : []),
       [card.archived ? button("📤 Unarchive", "unarchive") : button("🗄 Archive", "archive")],
     ],
   };
 }
 
+const backButton = (card: StudentCard): Button[] => [
+  { text: "\u2B05\uFE0F Back", data: callbackData({ kind: "student", studentId: card.id, action: "card" }) },
+];
+
 export const emailRemovalButtons = (card: StudentCard): Button[][] => [
   ...card.emails.map((email): Button[] => [
     { text: `✖️ ${email}`, data: callbackData({ kind: "remove_email", studentId: card.id, tag: emailTag(email) }) },
   ]),
-  [{ text: "⬅️ Back", data: callbackData({ kind: "student", studentId: card.id, action: "card" }) }],
+  backButton(card),
 ];
+
+export const titleRemovalButtons = (card: StudentCard): Button[][] => [
+  ...card.calendarNames.map((n): Button[] => [
+    { text: `\u2716\uFE0F ${n.title}`, data: callbackData({ kind: "remove_title", studentId: card.id, tag: emailTag(n.titleKey) }) },
+  ]),
+  backButton(card),
+];
+
+export const archiveConfirmMessage = (card: StudentCard): { text: string; buttons: Button[][] } => ({
+  text: `Archive ${card.name}? This detaches their calendar names: ${card.calendarNames.map((n) => n.title).join(", ")}. Unarchiving does not bring them back.`,
+  buttons: [
+    [{ text: "\u{1F5C4} Archive and detach", data: callbackData({ kind: "student", studentId: card.id, action: "archive!" }) }],
+    backButton(card),
+  ],
+});

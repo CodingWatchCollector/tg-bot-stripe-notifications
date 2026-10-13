@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "vitest";
 import first from "../migrations/0001_students_payments.sql?raw";
 import second from "../migrations/0002_drop_payments_livemode.sql?raw";
 import third from "../migrations/0003_balances.sql?raw";
+import fourth from "../migrations/0004_calendar_names.sql?raw";
 
 let db: DatabaseSync;
 const all = (sql: string) => db.prepare(sql).all() as Record<string, unknown>[];
@@ -125,5 +126,85 @@ describe("0003 balances", () => {
 
   test("both indexes exist", () => {
     expect(all("PRAGMA index_list(adjustments)").map((i) => i.name).sort()).toEqual(["adjustments_payment_id", "adjustments_student_id"]);
+  });
+});
+
+describe("0004 calendar names", () => {
+  const OLD_TABLES = ["students", "payer_emails", "payments", "adjustments"];
+  const snapshot = () => ({
+    rows: OLD_TABLES.map((t) => all(`SELECT * FROM ${t}`)),
+    master: all("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"),
+  });
+
+  beforeEach(() => {
+    db.exec(third);
+  });
+
+  test("leaves every 0001-0003 row and object untouched", () => {
+    db.exec("INSERT INTO payer_emails(email, student_id) VALUES ('a@x.com', 1)");
+    db.exec("INSERT INTO adjustments(student_id, delta, reason, created_at) VALUES (1, 2, 'r', 't')");
+    const before = snapshot();
+    db.exec(fourth);
+    const after = snapshot();
+    expect(after.rows).toEqual(before.rows);
+    expect(after.master.filter((o) => before.master.some((b) => b.name === o.name))).toEqual(before.master);
+  });
+
+  describe("after applying", () => {
+    beforeEach(() => {
+      db.exec(fourth);
+    });
+
+    const insertName = (cols: string, ...values: string[]) => `INSERT INTO calendar_names(${cols}) VALUES (${values.join(", ")})`;
+    const insertIgnored = (cols: string, ...values: string[]) => `INSERT INTO ignored_titles(${cols}) VALUES (${values.join(", ")})`;
+
+    test("calendar_names columns, primary key, foreign key and index", () => {
+      const cols = all("PRAGMA table_info(calendar_names)");
+      expect(cols.map((c) => c.name)).toEqual(["title_key", "student_id", "title", "created_at"]);
+      expect(cols.filter((c) => Number(c.pk) > 0).sort((a, b) => Number(a.pk) - Number(b.pk)).map((c) => c.name)).toEqual(["title_key", "student_id"]);
+      expect(all("PRAGMA foreign_key_list(calendar_names)")).toMatchObject([
+        { from: "student_id", table: "students", to: "id", on_update: "NO ACTION", on_delete: "NO ACTION" },
+      ]);
+      expect(all("PRAGMA index_info(calendar_names_student_id)").map((c) => c.name)).toEqual(["student_id"]);
+    });
+
+    test("ignored_titles columns and primary key", () => {
+      const cols = all("PRAGMA table_info(ignored_titles)");
+      expect(cols.map((c) => c.name)).toEqual(["title_key", "title", "created_at"]);
+      expect(cols.filter((c) => Number(c.pk) > 0).map((c) => c.name)).toEqual(["title_key"]);
+    });
+
+    test("calendar_names accepts a full row and the same key for two Students", () => {
+      db.exec("INSERT INTO students(id, name, name_key, created_at) VALUES (2, 'Yeva', 'yeva', 't')");
+      db.exec(insertName("title_key, student_id, title, created_at", "'duo'", "1", "'Duo'", "'t'"));
+      db.exec(insertName("title_key, student_id, title, created_at", "'duo'", "2", "'duo'", "'t'"));
+      expect(all("SELECT student_id FROM calendar_names ORDER BY student_id")).toEqual([{ student_id: 1 }, { student_id: 2 }]);
+    });
+
+    test.each([
+      ["duplicate key and student", insertName("title_key, student_id, title, created_at", "'k'", "1", "'K'", "'t'")],
+      ["unknown student", insertName("title_key, student_id, title, created_at", "'z'", "99", "'Z'", "'t'")],
+      ["NULL student", insertName("title_key, title, created_at", "'z'", "'Z'", "'t'")],
+      ["NULL key", insertName("student_id, title, created_at", "1", "'Z'", "'t'")],
+      ["empty key", insertName("title_key, student_id, title, created_at", "''", "1", "'Z'", "'t'")],
+      ["NULL title", insertName("title_key, student_id, created_at", "'z'", "1", "'t'")],
+      ["blank title", insertName("title_key, student_id, title, created_at", "'z'", "1", "'   '", "'t'")],
+      ["missing created_at", insertName("title_key, student_id, title", "'z'", "1", "'Z'")],
+    ])("calendar_names rejects %s", (_name, sql) => {
+      db.exec(insertName("title_key, student_id, title, created_at", "'k'", "1", "'K'", "'t'"));
+      rejects(sql);
+    });
+
+    test.each([
+      ["duplicate key", insertIgnored("title_key, title, created_at", "'k'", "'K'", "'t'")],
+      ["NULL key", insertIgnored("title, created_at", "'Z'", "'t'")],
+      ["empty key", insertIgnored("title_key, title, created_at", "''", "'Z'", "'t'")],
+      ["NULL title", insertIgnored("title_key, created_at", "'z'", "'t'")],
+      ["blank title", insertIgnored("title_key, title, created_at", "'z'", "'  '", "'t'")],
+      ["missing created_at", insertIgnored("title_key, title", "'z'", "'Z'")],
+    ])("ignored_titles rejects %s", (_name, sql) => {
+      db.exec(insertIgnored("title_key, title, created_at", "'k'", "'K'", "'t'"));
+      rejects(sql);
+    });
   });
 });

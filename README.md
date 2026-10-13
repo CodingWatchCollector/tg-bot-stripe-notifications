@@ -149,6 +149,14 @@ D1 Time Travel together with a code revert.
 v2.1b-1 note: Pack Payments recorded before the v2.1b-1 deploy (including any that arrive between steps 3 and 4) are not
 credited. Set opening Balances with `/adjust Name +N opening balance`.
 
+v2.2b note: 0004 only adds two tables (`calendar_names`, `ignored_titles`), so the running Worker keeps working between
+steps 3 and 4. Apply 0004 before deploying: the new code reads `calendar_names` on every Student card, so deployed
+first it fails card taps, prompt replies and archiving until the migration is applied (Stripe deliveries keep working).
+Rolling the code back is safe because the old code never reads the new tables. A Student archived by the old code keeps
+any Calendar names it had. After rolling forward again, and before anyone is unarchived, remove them (first run a
+`SELECT` with the same WHERE clause to see what goes):
+`pnpm exec wrangler d1 execute tg-bot --remote --command "DELETE FROM calendar_names WHERE student_id IN (SELECT id FROM students WHERE archived = 1)"`.
+
 ### Reconciling with Notion
 
 To compare a Student's Balance with your own notes, list their ledger:

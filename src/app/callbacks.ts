@@ -1,4 +1,4 @@
-export type StudentAction = "open" | "card" | "+1" | "-1" | "name" | "user" | "email+" | "email-" | "archive" | "unarchive";
+export type StudentAction = "open" | "card" | "+1" | "-1" | "name" | "user" | "email+" | "email-" | "title+" | "title-" | "archive" | "archive!" | "unarchive";
 
 export type Callback =
   | { kind: "assign"; paymentId: number; studentId: number }
@@ -6,11 +6,12 @@ export type Callback =
   | { kind: "dismiss"; paymentId: number }
   | { kind: "adjust_payment"; paymentId: number; delta: 1 | -1 }
   | { kind: "student"; studentId: number; action: StudentAction }
-  | { kind: "remove_email"; studentId: number; tag: string };
+  | { kind: "remove_email"; studentId: number; tag: string }
+  | { kind: "remove_title"; studentId: number; tag: string };
 
 // Telegram caps callback data at 64 bytes; 16-digit ids keep the longest form at 37.
 const PAYMENT = /^p:(\d{1,16}):(?:s:(\d{1,16})|(new)|(x)|([+-]1))$/;
-const STUDENT = /^s:(\d{1,16}):(?:(open|card|\+1|-1|name|user|email\+|email-|archive|unarchive)|rm:([0-9a-f]{8}))$/;
+const STUDENT = /^s:(\d{1,16}):(?:(open|card|\+1|-1|name|user|email\+|email-|title\+|title-|archive!|archive|unarchive)|rm:([0-9a-f]{8})|rt:([0-9a-f]{8}))$/;
 
 export function callbackData(cb: Callback): string {
   switch (cb.kind) {
@@ -26,6 +27,8 @@ export function callbackData(cb: Callback): string {
       return `s:${cb.studentId}:${cb.action}`;
     case "remove_email":
       return `s:${cb.studentId}:rm:${cb.tag}`;
+    case "remove_title":
+      return `s:${cb.studentId}:rt:${cb.tag}`;
     default: {
       const unreachable: never = cb;
       return unreachable;
@@ -56,6 +59,7 @@ export function parseCallback(data: string): Callback | null {
   const studentId = safeId(s[1]);
   if (studentId === null) return null;
   if (s[3] !== undefined) return { kind: "remove_email", studentId, tag: s[3] };
+  if (s[4] !== undefined) return { kind: "remove_title", studentId, tag: s[4] };
   return { kind: "student", studentId, action: s[2] as StudentAction };
 }
 

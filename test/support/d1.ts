@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import first from "../../migrations/0001_students_payments.sql?raw";
 import second from "../../migrations/0002_drop_payments_livemode.sql?raw";
 import third from "../../migrations/0003_balances.sql?raw";
+import fourth from "../../migrations/0004_calendar_names.sql?raw";
 
 type Value = string | number | bigint | null;
 type Row = Record<string, Value>;
@@ -19,6 +20,7 @@ export function createD1Fake() {
   db.exec(first);
   db.exec(second);
   db.exec(third);
+  db.exec(fourth);
   let failing: Method | "any" | null = null;
   let beforeBatch: (() => void) | null = null;
 
@@ -101,6 +103,15 @@ export function createD1Fake() {
     },
     beforeNextBatch(fn: () => void) {
       beforeBatch = fn;
+    },
+    // Runs a raw statement once before the next batch and returns the run count, so a hook that never fired can be asserted.
+    runBeforeNextBatch(sql: string, ...params: Value[]) {
+      const runs = { n: 0 };
+      beforeBatch = () => {
+        runs.n++;
+        db.prepare(sql).run(...params);
+      };
+      return runs;
     },
     failNext(method: Method | "any" = "any") {
       failing = method;

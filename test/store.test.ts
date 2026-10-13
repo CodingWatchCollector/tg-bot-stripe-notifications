@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { createStore, type Store } from "../src/db/store";
+import { createStore, attachTitleStatement, type Store } from "../src/db/store";
+import { classifyOccurrence, titleKey } from "../src/domain/calendar";
 import { createD1Fake, type D1Fake } from "./support/d1";
-import { PRODUCTS_FIXTURE, addAdjustment, addStudent, payment } from "./support/seed";
+import { PRODUCTS_FIXTURE, addAdjustment, addCalendarName, addIgnoredTitle, addStudent, payment } from "./support/seed";
 
 let fake: D1Fake;
 let store: Store;
@@ -744,6 +745,7 @@ describe("renameStudent", () => {
         createdAt: "2026-10-01T00:00:00.000Z",
         balance: 5,
         emails: ["olena@example.com"],
+        calendarNames: [],
       },
     });
   });
@@ -759,6 +761,7 @@ describe("student card writes", () => {
     createdAt: "2026-10-01T00:00:00.000Z",
     balance: 0,
     emails: [] as string[],
+    calendarNames: [] as unknown[],
     ...over,
   });
   const emailRows = () => rows("SELECT email, student_id FROM payer_emails ORDER BY email");
@@ -783,15 +786,15 @@ describe("student card writes", () => {
   describe("setArchived", () => {
     test("archives and unarchives, reporting the card", async () => {
       const olena = addStudent(fake, "Olena");
-      expect(await store.setArchived(olena, true)).toEqual({ kind: "updated", card: cardOf(olena, { archived: true }) });
-      expect(await store.setArchived(olena, false)).toEqual({ kind: "updated", card: cardOf(olena) });
+      expect(await store.setArchived(olena, true)).toEqual({ kind: "updated", card: cardOf(olena, { archived: true }), detached: [] });
+      expect(await store.setArchived(olena, false)).toEqual({ kind: "updated", card: cardOf(olena), detached: [] });
       expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
     });
 
     test("a second archive is already_resolved [C1]", async () => {
       const olena = addStudent(fake, "Olena");
       await store.setArchived(olena, true);
-      expect(await store.setArchived(olena, true)).toEqual({ kind: "already_resolved", card: cardOf(olena, { archived: true }) });
+      expect(await store.setArchived(olena, true)).toEqual({ kind: "already_resolved", card: cardOf(olena, { archived: true }), detached: [] });
     });
 
     test("an unknown id is not_found", async () => {
@@ -874,5 +877,303 @@ describe("student card writes", () => {
     test("an unknown id is not_found", async () => {
       expect(await store.setUsername(99, "abcd")).toEqual({ kind: "not_found" });
     });
+  });
+});
+
+describe("Calendar names", () => {
+  const DUO = "Duo B2/C1 (Mira K, Yeva)";
+  const nameRows = () => rows("SELECT title_key, student_id, title FROM calendar_names ORDER BY title_key, student_id");
+  const ignoredRows = () => rows("SELECT title_key, title FROM ignored_titles ORDER BY title_key");
+  const titles = (card: { calendarNames: { title: string }[] } | null) => card?.calendarNames.map((n) => n.title);
+  const inject = (sql: string, ...params: (string | number)[]) => fake.runBeforeNextBatch(sql, ...params);
+
+  describe("attachTitleStatement", () => {
+    test("[22b-M6] an ignored key is not attached when the statement runs alone", async () => {
+      const marko = addStudent(fake, "Marko");
+      addIgnoredTitle(fake, "Prep");
+      const [out] = await fake.d1.batch([attachTitleStatement(fake.d1, marko, "prep", "t")]);
+      expect(out?.results).toEqual([]);
+      expect(nameRows()).toEqual([]);
+      expect(ignoredRows()).toEqual([{ title_key: "prep", title: "Prep" }]);
+    });
+
+    test("without an ignored row it inserts and returns the key", async () => {
+      const marko = addStudent(fake, "Marko");
+      const [out] = await fake.d1.batch([attachTitleStatement(fake.d1, marko, "prep", "t")]);
+      expect(out?.results).toEqual([{ title_key: titleKey("prep") }]);
+      expect(nameRows()).toEqual([{ title_key: "prep", student_id: marko, title: "prep" }]);
+    });
+  });
+
+  describe("addCalendarName", () => {
+    test("stores the title under the classifier's key", async () => {
+      const marko = addStudent(fake, "Marko");
+      const out = await store.addCalendarName(marko, "  Duo   B2/C1  (Mira K, Yeva) ");
+      expect(out).toMatchObject({ kind: "added", title: DUO, sharedWith: [], unignored: false });
+      expect(nameRows()).toEqual([{ title_key: titleKey(DUO), student_id: marko, title: DUO }]);
+      const sets = await store.getTitleSets();
+      expect(classifyOccurrence({ title: "duo b2/c1 (mira k,  yeva)", allDay: false }, sets)).toEqual({
+        kind: "lesson",
+        titleKey: titleKey(DUO),
+        studentIds: [marko],
+      });
+    });
+
+    test("NFD input is stored as NFC and matches an NFC feed title", async () => {
+      const taras = addStudent(fake, "Taras");
+      const out = await store.addCalendarName(taras, "\u0406\u0308 Taras");
+      expect(out).toMatchObject({ kind: "added", title: "\u0407 Taras" });
+      expect(rows("SELECT title FROM calendar_names")).toEqual([{ title: "\u0407 Taras" }]);
+      expect(classifyOccurrence({ title: "\u0407 Taras", allDay: false }, await store.getTitleSets())).toMatchObject({
+        kind: "lesson",
+        studentIds: [taras],
+      });
+    });
+
+    test("a shared title lists the other Student on both cards", async () => {
+      const miraK = addStudent(fake, "Mira K");
+      const yeva = addStudent(fake, "Yeva");
+      await store.addCalendarName(miraK, DUO);
+      const out = await store.addCalendarName(yeva, "duo b2/c1 (mira k, yeva)");
+      expect(out).toMatchObject({ kind: "added", title: "duo b2/c1 (mira k, yeva)", sharedWith: ["Mira K"] });
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK, yeva]);
+      expect((await store.getTitleSets()).attached.get(titleKey(DUO))).toEqual([miraK, yeva]);
+      expect((await store.getStudentCard(miraK))?.calendarNames).toEqual([{ title: DUO, titleKey: titleKey(DUO), sharedWith: ["Yeva"] }]);
+      expect((await store.getStudentCard(yeva))?.calendarNames).toEqual([
+        { title: "duo b2/c1 (mira k, yeva)", titleKey: titleKey(DUO), sharedWith: ["Mira K"] },
+      ]);
+    });
+
+    test("a title already attached is already_resolved with the stored spelling", async () => {
+      const marko = addStudent(fake, "Marko");
+      await store.addCalendarName(marko, "Marko");
+      const before = nameRows();
+      const out = await store.addCalendarName(marko, "MARKO");
+      expect(out).toMatchObject({ kind: "already_resolved", title: "Marko" });
+      expect(nameRows()).toEqual(before);
+    });
+
+    test("a blank title rejects and writes nothing", async () => {
+      const marko = addStudent(fake, "Marko");
+      await expect(store.addCalendarName(marko, "   ")).rejects.toThrow();
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("[22b-M1] an archived Student gets archived and nothing is written", async () => {
+      const marko = addStudent(fake, "Marko", { archived: true });
+      const out = await store.addCalendarName(marko, "Marko");
+      expect(out).toMatchObject({ kind: "archived" });
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("an unknown id is not_found", async () => {
+      expect(await store.addCalendarName(99, "Marko")).toEqual({ kind: "not_found" });
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("[22b-M1] a Student archived before the batch gets archived and no row", async () => {
+      const marko = addStudent(fake, "Marko");
+      const runs = inject("UPDATE students SET archived = 1 WHERE id = ?1", marko);
+      const out = await store.addCalendarName(marko, "Marko");
+      expect(runs.n).toBe(1);
+      expect(out).toMatchObject({ kind: "archived" });
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("[22b-M5] an archived Student with an ignored key keeps the ignored row", async () => {
+      const marko = addStudent(fake, "Marko", { archived: true });
+      addIgnoredTitle(fake, "Prep");
+      const out = await store.addCalendarName(marko, "prep");
+      expect(out).toMatchObject({ kind: "archived" });
+      expect(ignoredRows()).toEqual([{ title_key: "prep", title: "Prep" }]);
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("[22b-M2] attaching an ignored title un-ignores it", async () => {
+      const marko = addStudent(fake, "Marko");
+      addIgnoredTitle(fake, "Prep");
+      const out = await store.addCalendarName(marko, "prep");
+      expect(out).toMatchObject({ kind: "added", title: "prep", unignored: true });
+      expect(ignoredRows()).toEqual([]);
+      expect(nameRows()).toEqual([{ title_key: "prep", student_id: marko, title: "prep" }]);
+      const sets = await store.getTitleSets();
+      expect(sets.attached.get("prep")).toEqual([marko]);
+      expect(sets.ignored.has("prep")).toBe(false);
+    });
+
+    test("without an ignored row unignored is false", async () => {
+      const marko = addStudent(fake, "Marko");
+      expect(await store.addCalendarName(marko, "Prep")).toMatchObject({ kind: "added", unignored: false });
+    });
+
+    test("[22b-M2] a title ignored just before the batch is still attached and un-ignored", async () => {
+      const marko = addStudent(fake, "Marko");
+      const runs = inject("INSERT INTO ignored_titles(title_key, title, created_at) VALUES ('prep', 'Prep', 't')");
+      const out = await store.addCalendarName(marko, "Prep");
+      expect(runs.n).toBe(1);
+      expect(out).toMatchObject({ kind: "added", unignored: true });
+      expect(ignoredRows()).toEqual([]);
+      expect(nameRows()).toHaveLength(1);
+    });
+
+    test("the same row inserted before the batch is already_resolved with one row", async () => {
+      const marko = addStudent(fake, "Marko");
+      const runs = inject("INSERT INTO calendar_names(title_key, student_id, title, created_at) VALUES ('marko', ?1, 'Marko', 't')", marko);
+      const out = await store.addCalendarName(marko, "Marko");
+      expect(runs.n).toBe(1);
+      expect(out).toMatchObject({ kind: "already_resolved", title: "Marko" });
+      expect(nameRows()).toHaveLength(1);
+    });
+  });
+
+  describe("removeCalendarName", () => {
+    test("deletes only this Student's row and reports its stored spelling", async () => {
+      const miraK = addStudent(fake, "Mira K");
+      const yeva = addStudent(fake, "Yeva");
+      addCalendarName(fake, yeva, "Yeva");
+      addCalendarName(fake, miraK, DUO);
+      addCalendarName(fake, yeva, "duo b2/c1 (mira k, yeva)");
+      const out = await store.removeCalendarName(yeva, titleKey("Yeva"));
+      expect(out).toMatchObject({ kind: "removed", title: "Yeva" });
+      expect(titles(out.kind === "removed" ? out.card : null)).toEqual(["duo b2/c1 (mira k, yeva)"]);
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK, yeva]);
+      const again = await store.removeCalendarName(yeva, titleKey("Yeva"));
+      expect(again).toMatchObject({ kind: "already_resolved" });
+    });
+
+    test("an unknown id is not_found", async () => {
+      expect(await store.removeCalendarName(99, "x")).toEqual({ kind: "not_found" });
+    });
+  });
+
+  describe("setArchived detaches", () => {
+    test("[22b-M3] detaches only the archived Student's rows, sorted", async () => {
+      const miraK = addStudent(fake, "Mira K");
+      const yeva = addStudent(fake, "Yeva");
+      addCalendarName(fake, yeva, "Yeva");
+      addCalendarName(fake, yeva, DUO);
+      addCalendarName(fake, miraK, DUO);
+      const out = await store.setArchived(yeva, true);
+      expect(out).toMatchObject({ kind: "updated", detached: [DUO, "Yeva"] });
+      expect(nameRows()).toEqual([{ title_key: titleKey(DUO), student_id: miraK, title: DUO }]);
+    });
+
+    test("a Student without names reports nothing detached", async () => {
+      const yeva = addStudent(fake, "Yeva");
+      expect(await store.setArchived(yeva, true)).toMatchObject({ kind: "updated", detached: [] });
+    });
+
+    test("archiving an archived Student is already_resolved with nothing detached", async () => {
+      const yeva = addStudent(fake, "Yeva", { archived: true });
+      expect(await store.setArchived(yeva, true)).toMatchObject({ kind: "already_resolved", detached: [] });
+    });
+
+    test("a failing DELETE leaves the Student active with both rows", async () => {
+      const yeva = addStudent(fake, "Yeva");
+      addCalendarName(fake, yeva, "Yeva");
+      addCalendarName(fake, yeva, DUO);
+      fake.raw.run("CREATE TEMP TRIGGER fail_detach BEFORE DELETE ON calendar_names BEGIN SELECT RAISE(ABORT, 'injected'); END");
+      await expect(store.setArchived(yeva, true)).rejects.toThrow(/injected/);
+      expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+      expect(nameRows()).toHaveLength(2);
+    });
+
+    test("a failing UPDATE keeps both rows", async () => {
+      const yeva = addStudent(fake, "Yeva");
+      addCalendarName(fake, yeva, "Yeva");
+      addCalendarName(fake, yeva, DUO);
+      fake.raw.run("CREATE TEMP TRIGGER fail_archive BEFORE UPDATE ON students BEGIN SELECT RAISE(ABORT, 'injected'); END");
+      await expect(store.setArchived(yeva, true)).rejects.toThrow(/injected/);
+      expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+      expect(nameRows()).toHaveLength(2);
+    });
+  });
+
+  describe("unarchive restores nothing", () => {
+    let yeva: number;
+    beforeEach(async () => {
+      yeva = addStudent(fake, "Yeva");
+      addCalendarName(fake, yeva, "Yeva");
+      await store.setArchived(yeva, true);
+    });
+
+    const expectBare = async () => {
+      expect((await store.getStudentCard(yeva))?.calendarNames).toEqual([]);
+      expect([...(await store.getTitleSets()).attached.values()].flat()).not.toContain(yeva);
+      expect(await store.addCalendarName(yeva, "Yeva")).toMatchObject({ kind: "added" });
+    };
+
+    test("setArchived(false)", async () => {
+      await store.setArchived(yeva, false);
+      await expectBare();
+    });
+
+    test("assignPayment of a Pack", async () => {
+      const p = await store.recordPayment(payment({}, "cs_a"), null, pack);
+      await store.assignPayment(p.id, yeva);
+      expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+      await expectBare();
+    });
+
+    test("recordPayment of a Pack matched to her", async () => {
+      const archived = (await store.getStudentCard(yeva))!;
+      await store.recordPayment(payment({}, "cs_b"), archived, pack);
+      expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+      await expectBare();
+    });
+
+    test("adjustStudent", async () => {
+      await store.adjustStudent(yeva, 1, "-");
+      expect(rows("SELECT archived FROM students")).toEqual([{ archived: 0 }]);
+      await expectBare();
+    });
+  });
+
+  describe("leftover rows of an archived Student", () => {
+    let miraK: number;
+    let yeva: number;
+    beforeEach(() => {
+      miraK = addStudent(fake, "Mira K");
+      yeva = addStudent(fake, "Yeva", { archived: true });
+      addCalendarName(fake, miraK, DUO);
+      addCalendarName(fake, yeva, DUO);
+      addCalendarName(fake, yeva, "Yeva");
+      addIgnoredTitle(fake, "Prep");
+      addIgnoredTitle(fake, "Taras morning");
+    });
+
+    test("[22b-M4] getTitleSets and sharedWith ignore them", async () => {
+      const sets = await store.getTitleSets();
+      expect([...sets.attached.values()].flat()).not.toContain(yeva);
+      expect(sets.attached.get(titleKey(DUO))).toEqual([miraK]);
+      expect(sets.attached.has(titleKey("Yeva"))).toBe(false);
+      expect(sets.ignored).toEqual(new Set(["prep", "taras morning"]));
+      expect((await store.getStudentCard(miraK))?.calendarNames).toEqual([{ title: DUO, titleKey: titleKey(DUO), sharedWith: [] }]);
+    });
+
+    test("the archived card lists them and archiving again removes them", async () => {
+      expect(titles(await store.getStudentCard(yeva))).toEqual([DUO, "Yeva"]);
+      const out = await store.setArchived(yeva, true);
+      expect(out).toMatchObject({ kind: "already_resolved", detached: [DUO, "Yeva"] });
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK]);
+    });
+  });
+
+  test("names, sharedWith and detached use collator order, not insertion or binary order", async () => {
+    const taras = addStudent(fake, "Taras");
+    const miraK = addStudent(fake, "Mira K");
+    const yeva = addStudent(fake, "Yeva");
+    const D = "Duo C1 (Taras, Yeva, Mira K)";
+    for (const t of ["Taras morning", "taras afternoon", "Taras evening"]) await store.addCalendarName(taras, t);
+    await store.addCalendarName(taras, D);
+    await store.addCalendarName(yeva, D);
+    await store.addCalendarName(miraK, D);
+
+    const card = await store.getStudentCard(taras);
+    expect(titles(card)).toEqual([D, "taras afternoon", "Taras evening", "Taras morning"]);
+    expect(card?.calendarNames[0]?.sharedWith).toEqual(["Mira K", "Yeva"]);
+    expect((await store.getStudentCard(yeva))?.calendarNames[0]?.sharedWith).toEqual(["Mira K", "Taras"]);
+    expect((await store.getTitleSets()).attached.get(titleKey(D))).toEqual([taras, miraK, yeva]);
+    expect(await store.setArchived(taras, true)).toMatchObject({ detached: titles(card) });
   });
 });

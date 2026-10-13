@@ -6,7 +6,7 @@ import { createStore, type Store } from "../src/db/store";
 import { createWorker } from "../src/worker";
 import { createD1Fake, type D1Fake } from "./support/d1";
 import type { Product } from "../src/domain/products";
-import { PRODUCTS_FIXTURE, addAdjustment, addStudent, payment } from "./support/seed";
+import { PRODUCTS_FIXTURE, addAdjustment, addCalendarName, addIgnoredTitle, addStudent, payment } from "./support/seed";
 
 const CHAT = "-100777";
 const SECRET = "tg_secret";
@@ -875,20 +875,28 @@ describe("/students with Balances", () => {
   });
 });
 
-const CARD_TEXT = (name: string, balance: number, emails: string, telegram: string, archived = false) =>
-  `👤 ${name}${archived ? " (archived)" : ""}\nBalance: ${balance}\nEmails: ${emails}\nTelegram: ${telegram}`;
+const CARD_TEXT = (name: string, balance: number, emails: string, telegram: string, archived = false, names = " none") =>
+  `👤 ${name}${archived ? " (archived)" : ""}\nBalance: ${balance}\nEmails: ${emails}\nTelegram: ${telegram}\nCalendar names:${names}`;
 const OLENA_EMAILS = "o2@example.com, olena@example.com";
 const buttonRow = (...b: [string, string][]) => b.map(([text, callback_data]) => ({ text, callback_data }));
-const cardKeyboard = (sid: number, archived: boolean, minus: boolean) => ({
+const titleRow = (sid: number, archived: boolean, names: boolean): [string, string][][] => {
+  const row: [string, string][] = [
+    ...(archived ? [] : ([["\u2795 Calendar name", `s:${sid}:title+`]] as [string, string][])),
+    ...(names ? ([["\u2796 Calendar name", `s:${sid}:title-`]] as [string, string][]) : []),
+  ];
+  return row.length === 0 ? [] : [row];
+};
+const cardKeyboard = (sid: number, archived: boolean, minus: boolean, names = false) => ({
   inline_keyboard: [
     buttonRow(["-1", `s:${sid}:-1`], ["+1", `s:${sid}:+1`]),
     buttonRow(["✏️ Rename", `s:${sid}:name`], ["👤 Username", `s:${sid}:user`]),
     buttonRow(["➕ Email", `s:${sid}:email+`], ...(minus ? ([["➖ Email", `s:${sid}:email-`]] as [string, string][]) : [])),
+    ...titleRow(sid, archived, names).map((r) => buttonRow(...r)),
     buttonRow(archived ? ["📤 Unarchive", `s:${sid}:unarchive`] : ["🗄 Archive", `s:${sid}:archive`]),
   ],
 });
-const ACTIVE = (sid: number, minus: boolean) => cardKeyboard(sid, false, minus);
-const ARCHIVED = (sid: number, minus: boolean) => cardKeyboard(sid, true, minus);
+const ACTIVE = (sid: number, minus: boolean, names = false) => cardKeyboard(sid, false, minus, names);
+const ARCHIVED = (sid: number, minus: boolean, names = false) => cardKeyboard(sid, true, minus, names);
 const CARD = { messageId: 60 };
 
 function seedCards() {
@@ -969,7 +977,7 @@ describe("opening the card", () => {
     const { old } = seedCards();
     await post(tap(`s:${old}:open`, CARD));
     expect(calls[1]?.payload).toMatchObject({
-      text: "👤 Old One (archived)\nBalance: 0\nEmails: none\nTelegram: not set",
+      text: "👤 Old One (archived)\nBalance: 0\nEmails: none\nTelegram: not set\nCalendar names: none",
       reply_markup: ARCHIVED(old, false),
     });
   });
@@ -1253,7 +1261,7 @@ describe("username on the card", () => {
     expect(calls).toHaveLength(1);
     const lines = String(calls[0]?.payload.text).split("\n");
     expect(lines[0]).toBe(note);
-    expect(lines.at(-1)).toBe(line);
+    expect(lines.at(-2)).toBe(line);
     expect(calls[0]?.payload.entities).toBeUndefined();
     expect(calls[0]?.payload).toMatchObject({ reply_markup: ACTIVE(olena, true), ...NOPREVIEW });
   });
@@ -1495,5 +1503,265 @@ describe("/adjust races", () => {
     fake.beforeNextBatch(() => fake.raw.run("UPDATE students SET archived = 1 WHERE id = ?1", olena));
     await post(message("/adjust Olena +2 x"));
     expect(String(calls[0]?.payload.text).endsWith("\nOlena was archived and is active again.")).toBe(true);
+  });
+});
+
+describe("Calendar names on the card", () => {
+  const DUO = "Duo B2/C1 (Mira K, Yeva)";
+  const TAG_DUO = "28b125b6";
+  const TAG_YEVA = "b1ad1d0a";
+  const OK = "\u2705";
+  const askText = (sid: number, name: string) => `Calendar name to add for student #${sid} (${name}):`;
+  const reply = (text: string, sid: number, name: string) => message(text, { reply: { text: askText(sid, name), fromId: 999 } });
+  const nameRows = () => fake.raw.all("SELECT title_key, student_id, title FROM calendar_names ORDER BY title_key, student_id");
+  const ignoredRows = () => fake.raw.all("SELECT title_key FROM ignored_titles");
+  const dumpAll = () => ({ names: nameRows(), ignored: ignoredRows(), students: fake.raw.all("SELECT id, archived FROM students") });
+  const removalKeyboard = (sid: number, ...rows: [string, string][]) => ({
+    inline_keyboard: [...rows.map((r) => buttonRow(r)), buttonRow(["\u2B05\uFE0F Back", `s:${sid}:card`])],
+  });
+  const injectOnce = (sql: string, ...params: (string | number)[]) => fake.runBeforeNextBatch(sql, ...params);
+  const duoLine = (others: string) => `\u2022 ${DUO}${others === "" ? "" : `, shared with ${others}`}`;
+
+  let marko: number;
+  let miraK: number;
+  let yeva: number;
+  beforeEach(() => {
+    marko = addStudent(fake, "Marko");
+    miraK = addStudent(fake, "Mira K");
+    yeva = addStudent(fake, "Yeva");
+  });
+
+  describe("adding", () => {
+    test("the prompt is sent with force_reply", async () => {
+      await post(tap(`s:${marko}:title+`, CARD));
+      expect(methods()).toEqual(["answerCallbackQuery", "sendMessage"]);
+      expect(calls[1]?.payload).toMatchObject({ chat_id: CHAT, text: askText(marko, "Marko"), reply_markup: { force_reply: true } });
+    });
+
+    test("a reply adds the name and sends a fresh card", async () => {
+      await post(reply("Marko", marko, "Marko"));
+      expect(nameRows()).toEqual([{ title_key: "marko", student_id: marko, title: "Marko" }]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.payload).toMatchObject({
+        text: `${OK} Added calendar name Marko to Marko.\n${CARD_TEXT("Marko", 0, "none", "not set", false, "\n\u2022 Marko")}`,
+        reply_markup: ACTIVE(marko, false, true),
+        ...NOPREVIEW,
+      });
+    });
+
+    test("a title attached to someone else says who shares it", async () => {
+      addCalendarName(fake, miraK, DUO);
+      await post(reply(DUO, yeva, "Yeva"));
+      expect(String(calls[0]?.payload.text).split("\n")[0]).toBe(`${OK} Added calendar name ${DUO} to Yeva. Shared with Mira K.`);
+      expect(String(calls[0]?.payload.text).split("\n").at(-1)).toBe(duoLine("Mira K"));
+      expect(nameRows()).toHaveLength(2);
+    });
+
+    test("an Ignored title is attached and un-ignored with a note", async () => {
+      addIgnoredTitle(fake, "Prep");
+      await post(reply("Prep", marko, "Marko"));
+      expect(String(calls[0]?.payload.text).split("\n")[0]).toBe(
+        `${OK} Added calendar name Prep to Marko. It was marked Not a lesson; its events now count as Lessons.`,
+      );
+      expect(ignoredRows()).toEqual([]);
+      expect(nameRows()).toEqual([{ title_key: "prep", student_id: marko, title: "Prep" }]);
+    });
+
+    test("a name already attached is noted and not duplicated", async () => {
+      addCalendarName(fake, marko, "Marko");
+      await post(reply("MARKO", marko, "Marko"));
+      expect(String(calls[0]?.payload.text).split("\n")[0]).toBe("Marko is already Marko's calendar name.");
+      expect(calls[0]?.payload.reply_markup).toBeDefined();
+      expect(nameRows()).toHaveLength(1);
+    });
+
+    test("a Student archived after the prompt is refused without a card", async () => {
+      fake.raw.run("UPDATE students SET archived = 1 WHERE id = ?1", marko);
+      await post(reply("Marko", marko, "Marko"));
+      expect(calls.map((c) => c.payload.text)).toEqual(["Marko is archived. Unarchive them first."]);
+      expect(calls[0]?.payload.reply_markup).toBeUndefined();
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("an unknown Student", async () => {
+      await post(reply("Marko", 999, "Ghost"));
+      expect(calls.map((c) => c.payload.text)).toEqual(["Student #999 not found."]);
+      expect(nameRows()).toEqual([]);
+    });
+
+    test.each([
+      ["blank", "   "],
+      ["101 code points", "x".repeat(101)],
+      ["a leading cancel mark", "\u274C Marko"],
+    ])("%s is refused", async (_n, text) => {
+      await post(reply(text, marko, "Marko"));
+      expect(calls.map((c) => c.payload.text)).toEqual([
+        "A calendar name is 1-100 characters and cannot start with \u274C, contain (\u043F\u0456\u0434\u0440\u044F\u0434\u043D\u0438\u0446\u044F) or contain \" \u2014 \".",
+      ]);
+      expect(nameRows()).toEqual([]);
+    });
+
+    test("an archived card answers Archived and sends nothing", async () => {
+      fake.raw.run("UPDATE students SET archived = 1 WHERE id = ?1", marko);
+      await post(tap(`s:${marko}:title+`, CARD));
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Archived" } });
+    });
+
+    test("an unknown Student is Not found", async () => {
+      await post(tap("s:999:title+", CARD));
+      onlyNotFound();
+    });
+  });
+
+  describe("removing", () => {
+    beforeEach(() => {
+      addCalendarName(fake, yeva, "Yeva");
+      addCalendarName(fake, yeva, DUO);
+      addCalendarName(fake, miraK, DUO);
+    });
+    const yevaText = (names: string, archived = false) => CARD_TEXT("Yeva", 0, "none", "not set", archived, names);
+    const both = `\n${duoLine("Mira K")}\n\u2022 Yeva`;
+
+    test("the removal keyboard keeps the card text, Back restores the card", async () => {
+      await post(tap(`s:${yeva}:title-`, CARD));
+      expect(methods()).toEqual(["answerCallbackQuery", "editMessageText"]);
+      expect(edited()?.payload).toMatchObject({
+        text: yevaText(both),
+        reply_markup: removalKeyboard(yeva, [`\u2716\uFE0F ${DUO}`, `s:${yeva}:rt:${TAG_DUO}`], ["\u2716\uFE0F Yeva", `s:${yeva}:rt:${TAG_YEVA}`]),
+      });
+      calls.length = 0;
+      await post(tap(`s:${yeva}:card`, CARD));
+      expect(edited()?.payload).toMatchObject({ text: yevaText(both), reply_markup: ACTIVE(yeva, false, true) });
+    });
+
+    test("removing one name leaves the other Student's row", async () => {
+      await post(tap(`s:${yeva}:rt:${TAG_DUO}`, CARD));
+      expect(nameRows().map((r) => [r.title, r.student_id])).toEqual([[DUO, miraK], ["Yeva", yeva]]);
+      expect(edited()?.payload).toMatchObject({ text: yevaText("\n\u2022 Yeva"), reply_markup: ACTIVE(yeva, false, true) });
+      expect(calls[0]?.payload.text).toBeUndefined();
+    });
+
+    test.each([["a second tap on the removed name", TAG_DUO], ["a tag matching no name", "00000000"]])("%s is Not found and edits the card", async (_n, tag) => {
+      await post(tap(`s:${yeva}:rt:${TAG_DUO}`, CARD));
+      calls.length = 0;
+      await post(tap(`s:${yeva}:rt:${tag}`, CARD));
+      expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+      expect(edited()?.payload).toMatchObject({ text: yevaText("\n\u2022 Yeva") });
+      expect(nameRows()).toHaveLength(2);
+    });
+
+    test("a row deleted before the batch is Already handled", async () => {
+      const runs = injectOnce("DELETE FROM calendar_names WHERE student_id = ?1 AND title_key = 'yeva'", yeva);
+      await post(tap(`s:${yeva}:rt:${TAG_YEVA}`, CARD));
+      expect(runs.n).toBe(1);
+      expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
+      expect(edited()?.payload).toMatchObject({ text: yevaText(`\n${duoLine("Mira K")}`) });
+    });
+
+    test("a card with no names answers Not found and edits the card", async () => {
+      await post(tap(`s:${marko}:title-`, CARD));
+      expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Not found" } });
+      expect(edited()?.payload).toMatchObject({ reply_markup: ACTIVE(marko, false, false) });
+    });
+
+    test("an archived Student's leftover name can be removed", async () => {
+      fake.raw.run("DELETE FROM calendar_names WHERE student_id = ?1", yeva);
+      fake.raw.run("UPDATE students SET archived = 1 WHERE id = ?1", yeva);
+      addCalendarName(fake, yeva, "Yeva");
+      await post(tap(`s:${yeva}:title-`, CARD));
+      expect(edited()?.payload).toMatchObject({ reply_markup: removalKeyboard(yeva, ["\u2716\uFE0F Yeva", `s:${yeva}:rt:${TAG_YEVA}`]) });
+      calls.length = 0;
+      await post(tap(`s:${yeva}:rt:${TAG_YEVA}`, CARD));
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK]);
+      expect(edited()?.payload).toMatchObject({ text: yevaText(" none", true), reply_markup: ARCHIVED(yeva, false, false) });
+    });
+
+    test.each(["title-", "rt:0a1b2c3d", "archive!"])("s:999:%s is Not found and writes nothing", async (action) => {
+      const before = dumpAll();
+      await post(tap(`s:999:${action}`, CARD));
+      onlyNotFound();
+      expect(dumpAll()).toEqual(before);
+    });
+  });
+
+  describe("archiving", () => {
+    beforeEach(() => {
+      addCalendarName(fake, yeva, "Yeva");
+      addCalendarName(fake, yeva, DUO);
+      addCalendarName(fake, miraK, DUO);
+    });
+    const archivedCard = (names = " none") => CARD_TEXT("Yeva", 0, "none", "not set", true, names);
+
+    test("the tap asks first and writes nothing; Back restores the card", async () => {
+      const before = dumpAll();
+      await post(tap(`s:${yeva}:archive`, CARD));
+      expect(calls[0]?.payload.text).toBeUndefined();
+      expect(edited()?.payload).toMatchObject({
+        text: `Archive Yeva? This detaches their calendar names: ${DUO}, Yeva. Unarchiving does not bring them back.`,
+        reply_markup: {
+          inline_keyboard: [buttonRow(["\u{1F5C4} Archive and detach", `s:${yeva}:archive!`]), buttonRow(["\u2B05\uFE0F Back", `s:${yeva}:card`])],
+        },
+      });
+      expect(dumpAll()).toEqual(before);
+      calls.length = 0;
+      await post(tap(`s:${yeva}:card`, CARD));
+      expect(edited()?.payload).toMatchObject({ reply_markup: ACTIVE(yeva, false, true) });
+      expect(dumpAll()).toEqual(before);
+    });
+
+    test("the confirmation archives, detaches and notes the names", async () => {
+      await post(tap(`s:${yeva}:archive!`, CARD));
+      expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${yeva}`)).toEqual([{ archived: 1 }]);
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK]);
+      expect(calls[0]?.payload.text).toBeUndefined();
+      expect(edited()?.payload).toMatchObject({
+        text: `Detached calendar names: ${DUO}, Yeva.\n${archivedCard()}`,
+        reply_markup: ARCHIVED(yeva, false, false),
+      });
+    });
+
+    test("a name added after the confirmation was shown is detached too", async () => {
+      await post(tap(`s:${yeva}:archive`, CARD));
+      addCalendarName(fake, yeva, "Taras morning");
+      calls.length = 0;
+      await post(tap(`s:${yeva}:archive!`, CARD));
+      expect(String(edited()?.payload.text).split("\n")[0]).toBe(`Detached calendar names: ${DUO}, Taras morning, Yeva.`);
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK]);
+    });
+
+    test("a stale confirmation on an archived Student is Already handled", async () => {
+      await post(tap(`s:${marko}:archive`, CARD));
+      calls.length = 0;
+      await post(tap(`s:${marko}:archive!`, CARD));
+      expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
+      expect(edited()?.payload).toMatchObject({ text: CARD_TEXT("Marko", 0, "none", "not set", true), reply_markup: ARCHIVED(marko, false, false) });
+    });
+
+    test("archiving an archived Student repairs leftover rows with a note", async () => {
+      const old = addStudent(fake, "Old One", { archived: true });
+      addCalendarName(fake, old, "Taras morning");
+      await post(tap(`s:${old}:archive`, CARD));
+      expect(calls[0]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "Already handled" } });
+      expect(String(edited()?.payload.text).split("\n")[0]).toBe("Detached calendar names: Taras morning.");
+      expect(nameRows().map((r) => r.student_id)).toEqual([miraK, yeva, yeva]);
+    });
+
+    test("a Student with no names archives in one tap without a note", async () => {
+      await post(tap(`s:${marko}:archive`, CARD));
+      expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${marko}`)).toEqual([{ archived: 1 }]);
+      expect(edited()?.payload.text).toBe(CARD_TEXT("Marko", 0, "none", "not set", true));
+    });
+  });
+
+  test("/adjust unarchives without restoring names", async () => {
+    addCalendarName(fake, yeva, "Yeva");
+    await post(tap(`s:${yeva}:archive!`, CARD));
+    calls.length = 0;
+    await post(message("/adjust Yeva +1"));
+    expect(fake.raw.all(`SELECT archived FROM students WHERE id = ${yeva}`)).toEqual([{ archived: 0 }]);
+    expect((await store.getStudentCard(yeva))?.calendarNames).toEqual([]);
+    expect([...(await store.getTitleSets()).attached.values()].flat()).not.toContain(yeva);
+    expect(await store.addCalendarName(yeva, "Yeva")).toMatchObject({ kind: "added" });
   });
 });

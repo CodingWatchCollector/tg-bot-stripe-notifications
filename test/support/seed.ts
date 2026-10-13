@@ -1,5 +1,6 @@
 import type { PaymentReceived } from "../../src/domain/payment";
 import type { Products } from "../../src/domain/products";
+import { titleKey } from "../../src/domain/calendar";
 import { nameKey } from "../../src/domain/student";
 import type { D1Fake } from "./d1";
 
@@ -51,4 +52,17 @@ export function addAdjustment(fake: D1Fake, studentId: number, delta: number, re
     reason,
     paymentId,
   );
+}
+
+export function addCalendarName(fake: D1Fake, studentId: number, title: string): void {
+  fake.raw.run(
+    "INSERT INTO calendar_names(title_key, student_id, title, created_at) VALUES (?1, ?2, ?3, '2026-10-01T00:00:00.000Z')",
+    titleKey(title),
+    studentId,
+    title,
+  );
+}
+
+export function addIgnoredTitle(fake: D1Fake, title: string): void {
+  fake.raw.run("INSERT INTO ignored_titles(title_key, title, created_at) VALUES (?1, ?2, '2026-10-01T00:00:00.000Z')", titleKey(title), title);
 }

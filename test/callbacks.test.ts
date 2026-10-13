@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { callbackData, emailTag, parseCallback, type Callback, type StudentAction } from "../src/app/callbacks";
 
 const MAX = 9007199254740991;
-const ACTIONS: StudentAction[] = ["open", "card", "+1", "-1", "name", "user", "email+", "email-", "archive", "unarchive"];
+const ACTIONS: StudentAction[] = ["open", "card", "+1", "-1", "name", "user", "email+", "email-", "title+", "title-", "archive", "archive!", "unarchive"];
 
 const everyKind = (id: number, pid: number): Callback[] => [
   { kind: "assign", paymentId: pid, studentId: id },
@@ -12,6 +12,7 @@ const everyKind = (id: number, pid: number): Callback[] => [
   { kind: "adjust_payment", paymentId: pid, delta: -1 },
   ...ACTIONS.map((action): Callback => ({ kind: "student", studentId: id, action })),
   { kind: "remove_email", studentId: id, tag: "7007e771" },
+  { kind: "remove_title", studentId: id, tag: "0a1b2c3d" },
 ];
 
 describe("callbackData", () => {
@@ -23,6 +24,10 @@ describe("callbackData", () => {
     [{ kind: "adjust_payment", paymentId: 12, delta: -1 }, "p:12:-1"],
     [{ kind: "student", studentId: 3, action: "email+" }, "s:3:email+"],
     [{ kind: "remove_email", studentId: 3, tag: "7007e771" }, "s:3:rm:7007e771"],
+    [{ kind: "student", studentId: 3, action: "title+" }, "s:3:title+"],
+    [{ kind: "student", studentId: 3, action: "title-" }, "s:3:title-"],
+    [{ kind: "student", studentId: 3, action: "archive!" }, "s:3:archive!"],
+    [{ kind: "remove_title", studentId: 3, tag: "0a1b2c3d" }, "s:3:rt:0a1b2c3d"],
   ] as [Callback, string][])("%j -> %s", (cb, data) => {
     expect(callbackData(cb)).toBe(data);
   });
@@ -48,6 +53,11 @@ describe("parseCallback", () => {
     "p:1:s:",
     "s:1:rm:XYZ12345",
     "s:1:rm:abc",
+    "s:1:rt:XYZ",
+    "s:1:rt:1234567",
+    "s:12345678901234567:rt:0a1b2c3d",
+    "s:1:title",
+    "s:1:archive!!",
     "s:1:open ",
     "q:1",
     "p:12345678901234567:x",
